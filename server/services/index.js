@@ -855,7 +855,6 @@ function buildAllChannels({ appServer, workspaceRoot, logger, configPath }) {
     [CHANNELS.Plugins]: { async list() { return { plugins: [] }; } },
     [CHANNELS.PluginManagement]: {
       async getPluginReferenceCatalog() { return { plugins: [] }; },
-      async installPlugin() { return { ok: false, error: 'not_supported' }; },
       async cancelPluginOperation() { return { ok: true }; },
       async resolveSuggestedPluginReference() { return null; },
       async setPluginEnabled() { return { ok: true }; },
@@ -866,9 +865,13 @@ function buildAllChannels({ appServer, workspaceRoot, logger, configPath }) {
         catch { return { plugins: [], diagnostics: [] }; }
       },
       async getPluginsOverview(p) {
-        try { return await appServer.request('plugins/overview', { workspace: normWorkspace(p) }, { timeoutMs: 30000 }); }
+        try { return await appServer.request('plugins/overview', { workspace: normWorkspace(p) }, { timeoutMs: 60000 }); }
         catch { return { plugins: [], marketplaces: [], availablePlugins: [], installedPlugins: [], restorableBuiltins: [], diagnostics: [] }; }
       },
+      // 市场管理操作也走 app-server（渲染器插件市场面板的「新建/刷新市场」按钮）
+      async installPlugin(p) { return appServer.request('plugins/install', { workspace: normWorkspace(p), pluginName: p.pluginName, marketplace: p.marketplace }, { timeoutMs: 120000 }); },
+      async addPluginMarketplace(p) { return appServer.request('plugins/marketplace/add', { workspace: normWorkspace(p), source: p.source }, { timeoutMs: 120000 }); },
+      async updatePluginMarketplace(p) { return appServer.request('plugins/marketplace/update', { workspace: normWorkspace(p), ...(p.marketplace ? { marketplace: p.marketplace } : {}) }, { timeoutMs: 180000 }); },
       onDynamicPluginOperationProgress: () => new Emitter().event,
     },
     [CHANNELS.Subagents]: { async list() { return { subagents: [] }; } },
