@@ -1,0 +1,1 @@
+import{n as e,t}from"./message-circle-plus-Dx4zasbt.js";export{e as __iconNode,t as default};

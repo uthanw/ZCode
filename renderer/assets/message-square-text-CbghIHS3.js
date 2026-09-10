@@ -1,0 +1,1 @@
+import{n as e,t}from"./message-square-text-CF_jUEKi.js";export{e as __iconNode,t as default};

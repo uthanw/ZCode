@@ -1,0 +1,12 @@
+# 运行时依赖与缓存
+node_modules/
+.cache/
+
+# 服务默认工作区（用户运行时数据，不入库）
+workspace/
+
+# 日志与临时文件
+*.log
+*.pid
+*.tmp
+/tmp/

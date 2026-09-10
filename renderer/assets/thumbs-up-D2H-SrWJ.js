@@ -1,0 +1,1 @@
+import{n as e,t}from"./thumbs-up-AcNU23sZ.js";export{e as __iconNode,t as default};

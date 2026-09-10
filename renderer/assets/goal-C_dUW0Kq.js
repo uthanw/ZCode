@@ -1,0 +1,1 @@
+import{n as e,t}from"./goal-BUXcDp_4.js";export{e as __iconNode,t as default};

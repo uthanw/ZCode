@@ -1,0 +1,1 @@
+import{n as e,t}from"./arrow-left-from-line-DB3GqD2Q.js";export{e as __iconNode,t as default};

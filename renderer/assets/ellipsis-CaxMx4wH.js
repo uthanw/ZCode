@@ -1,0 +1,1 @@
+import{n as e,t}from"./ellipsis-D-0AuB4X.js";export{e as __iconNode,t as default};
