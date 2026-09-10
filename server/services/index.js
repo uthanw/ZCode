@@ -101,6 +101,86 @@ function fileService({ logger, workspaceRoot }) {
     async saveFile() { return { success: false, error: 'not_supported' }; },
     async selectFile() { return { success: false, error: 'not_supported' }; },
     async selectDirectory() { return { success: false, error: 'not_supported' }; },
+    // 渲染器 hooks (useTaskSessionFilePath 等) 批量探测文件存在性
+    async checkFilesExist({ paths } = {}) {
+      const list = Array.isArray(paths) ? paths : [];
+      const results = {};
+      await Promise.all(list.map(async (p) => {
+        if (typeof p !== 'string') return;
+        try { results[p] = (await fsp.stat(p)).isFile(); } catch { results[p] = false; }
+      }));
+      return { results };
+    },
+    // 工作区文件检索 (composer @ 提及 / 命令面板 files scope)
+    // ⚠️ 契约: 返回裸数组 [{name, path, relativePath, type}] —— 渲染器 Dbe() 直接 .filter，
+    // 包一层 {files:[...]} 会崩 section ("e.filter is not a function")。与原版 host 一致。
+    // 过滤规则也对齐原版: 跳过 vcs/构建目录、隐藏目录、.env*、二进制扩展名。
+    async listWorkspaceFiles({ rootPath, workspacePath } = {}) {
+      const root = typeof rootPath === 'string' && rootPath ? rootPath
+        : (typeof workspacePath === 'string' && workspacePath ? workspacePath : workspaceRoot);
+      const SKIP_DIRS = new Set(['.git', '.hg', '.svn', 'node_modules', 'bower_components', 'jspm_packages', '__pycache__', 'site-packages', 'venv', 'coverage', 'htmlcov', 'lcov-report', 'cmakefiles', 'pods', 'deriveddata', 'storybook-static', 'playwright-report', 'test-results', 'allure-results', 'allure-report', 'cdk.out', 'eggs', 'pip-wheel-metadata', 'wheels']);
+      const SKIP_DIR_PREFIX = ['cmake-build-', 'bazel-'];
+      const SKIP_DIR_SUFFIX = ['.egg-info', '.dist-info'];
+      const SKIP_FILES = new Set(['coverage.out', 'lcov.info']);
+      const BINARY_EXT = new Set(['.a', '.aar', '.beam', '.class', '.dll', '.dylib', '.ear', '.exe', '.gcda', '.gcno', '.gem', '.hi', '.idb', '.ilk', '.jar', '.lib', '.node', '.nupkg', '.o', '.obj', '.pdb', '.profdata', '.profraw', '.pyc', '.pyo', '.rlib', '.so', '.tsbuildinfo', '.war']);
+      const shouldSkipDir = (name) => {
+        const t = name.toLowerCase();
+        return SKIP_DIRS.has(t) || SKIP_DIR_PREFIX.some((p) => t.startsWith(p)) || SKIP_DIR_SUFFIX.some((p) => t.endsWith(p));
+      };
+      const shouldSkipFile = (name) => {
+        const t = name.toLowerCase();
+        return t === '.env' || t.startsWith('.env.') || SKIP_FILES.has(t) || BINARY_EXT.has(path.extname(t));
+      };
+      const out = [];
+      const stack = [root];
+      while (stack.length > 0) {
+        const dir = stack.pop();
+        if (!dir) continue;
+        let entries;
+        try { entries = await fsp.readdir(dir, { withFileTypes: true }); } catch { continue; }
+        for (const ent of entries) {
+          const full = path.join(dir, ent.name);
+          const rel = path.relative(root, full) || ent.name;
+          const type = ent.isDirectory() ? 'directory' : (ent.isSymbolicLink() ? 'symlink' : 'file');
+          // 原版规则: 隐藏目录内的一切都不列出
+          const inHidden = rel.split(path.sep).slice(0, -1).some((p) => p.startsWith('.'));
+          if (type === 'directory') {
+            if (shouldSkipDir(ent.name)) continue;
+            if (!ent.name.startsWith('.') && !inHidden) out.push({ name: ent.name, path: full, relativePath: rel, type });
+            if (!ent.isSymbolicLink()) stack.push(full);
+          } else {
+            if (shouldSkipFile(ent.name) || inHidden) continue;
+            out.push({ name: ent.name, path: full, relativePath: rel, type });
+          }
+          if (out.length >= 5000) break;
+        }
+        if (out.length >= 5000) break;
+      }
+      // 原版排序: 目录在前, 同类按 relativePath 字典序
+      out.sort((a, b) => (a.type !== b.type
+        ? (a.type === 'directory' ? -1 : 1)
+        : String(a.relativePath).localeCompare(String(b.relativePath))));
+      return out;
+    },
+    // 轻量文本读取 (设置页/命令文件预览)
+    async readTextFile({ path: p, maxBytes } = {}) {
+      if (typeof p !== 'string') throw new Error('readTextFile: path required');
+      const b = await fsp.readFile(p);
+      const sliced = Number.isFinite(maxBytes) && maxBytes > 0 ? b.subarray(0, maxBytes) : b;
+      return { text: sliced.toString('utf8'), totalBytes: b.length, truncated: sliced.length < b.length };
+    },
+    // 二进制预览 (图片/音视频 attach 前的快速探测)
+    async readBinaryPreview({ path: p, maxBytes } = {}) {
+      if (typeof p !== 'string') throw new Error('readBinaryPreview: path required');
+      const st = await fsp.stat(p);
+      const len = Number.isFinite(maxBytes) && maxBytes > 0 ? Math.min(maxBytes, st.size) : Math.min(st.size, 2 * 1024 * 1024);
+      const fh = await fsp.open(p, 'r');
+      try {
+        const buf = Buffer.alloc(len);
+        const { bytesRead } = await fh.read(buf, 0, len, 0);
+        return { dataBase64: buf.subarray(0, bytesRead).toString('base64'), totalBytes: st.size, truncated: bytesRead < st.size };
+      } finally { await fh.close(); }
+    },
   };
 }
 
@@ -249,7 +329,7 @@ function terminalService({ logger }) {
 }
 
 // ---------- Git（简单封装 git CLI）----------
-function gitService({ logger }) {
+function gitService({ logger, workspaceRoot }) {
   const run = async (args, cwd) => new Promise((resolve) => {
     require('child_process').execFile('git', args, { cwd, maxBuffer: 32 * 1024 * 1024 }, (err, stdout, stderr) => {
       resolve({ ok: !err, stdout: stdout || '', stderr: stderr || '' });
@@ -272,6 +352,23 @@ function gitService({ logger }) {
       return { name: n.stdout.trim() || '', email: e.stdout.trim() || '' };
     },
     async refresh({ workspacePath }) { return { ok: true }; },
+    // .gitignore / .zcodeignore 规则查询（源控制树过滤未跟踪噪声）
+    async getIgnoredPaths({ workspacePath, paths } = {}) {
+      const list = Array.isArray(paths) ? paths : [];
+      if (!list.length) return { ignored: [] };
+      const cwd = typeof workspacePath === 'string' && workspacePath ? workspacePath : workspaceRoot;
+      // check-ignore 多路径一次跑；退出码 0=有忽略 1=全没忽略
+      const st = await run(['check-ignore', '--stdin', '-z'], cwd);
+      // execFile 不支持 stdin 输入，退化成逐路径 check-ignore
+      const ignored = [];
+      for (const p of list) {
+        if (typeof p !== 'string') continue;
+        const r = await run(['check-ignore', '-q', p], cwd);
+        if (r.ok) ignored.push(p); // check-ignore -q: 0 → 被忽略
+      }
+      void st;
+      return { ignored };
+    },
   };
 }
 
@@ -823,7 +920,7 @@ function buildAllChannels({ appServer, workspaceRoot, logger, configPath }) {
     [CHANNELS.System]: systemService(),
     [CHANNELS.Setting]: settingService({ logger }),
     [CHANNELS.Terminal]: terminalService({ logger }),
-    [CHANNELS.Git]: gitService({ logger }),
+    [CHANNELS.Git]: gitService({ logger, workspaceRoot }),
     [CHANNELS.FileWatcher]: fileWatcherService({ logger }),
     [CHANNELS.MediaPreview]: { async prepare() { return { kind: 'inline', dataBase64: '', mediaType: '', size: 0 }; } },
     [CHANNELS.GitCheckpoint]: { async listCheckpoints() { return { checkpoints: [] }; }, async create() { return { ok: false }; }, async diff() { return { diff: '' }; }, async restore() { return { ok: false }; } },
