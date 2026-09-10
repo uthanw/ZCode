@@ -636,11 +636,35 @@ function windowControllerService({ appServer, defaultWorkspace, logger, hub, ser
     return 'idle';
   }
 
+  // session/list 不带 workspace 是重查询（app-server 实测 ~10s），页面刷新会并发 6+ 次
+  // listTaskList/快照帧 → 必须短 TTL 缓存 + 在途去重，否则把 app-server 打挂（30s 超时风暴）。
+  let sessionsCache = { at: 0, promise: null, data: null };
+  const SESSIONS_TTL_MS = 5000;
   async function listSessionsRaw() {
-    try {
-      const res = await appServer.request('session/list', { workspace: { workspacePath: wsRoot, workspaceKey: wsRoot }, includeArchived: true, limit: 500 }, { timeoutMs: 30000 });
-      return res.sessions ?? [];
-    } catch (e) { logger.warn?.('[windowController] session/list failed:', e.message); return []; }
+    const now = Date.now();
+    if (sessionsCache.data && now - sessionsCache.at < SESSIONS_TTL_MS) return sessionsCache.data;
+    if (sessionsCache.promise) return sessionsCache.promise;
+    sessionsCache.promise = (async () => {
+      try {
+        // 不带 workspace 参数 → 返回所有 workspace 的 session（每个带真实 workspace.workspacePath）。
+        // 侧边栏「项目/对话」分区依赖 task.workspacePath 与查询 scope 匹配，必须用真实路径。
+        const res = await appServer.request('session/list', { includeArchived: true, limit: 500 }, { timeoutMs: 60000 });
+        sessionsCache.data = res.sessions ?? [];
+        sessionsCache.at = Date.now();
+        return sessionsCache.data;
+      } catch (e) {
+        logger.warn?.('[windowController] session/list failed:', e.message);
+        // 失败时返回上次成功的数据（如有），避免任务列表整体消失
+        return sessionsCache.data ?? [];
+      } finally { sessionsCache.promise = null; }
+    })();
+    return sessionsCache.promise;
+  }
+
+  // session 的真实工作区路径（「不在项目中工作」的会话挂在 ~/.zcode/workspace/default）
+  function sessionWorkspacePath(s) {
+    const p = s?.workspace?.workspacePath;
+    return (typeof p === 'string' && p) ? p : wsRoot;
   }
 
   function sessionToControllerTask(sess) {
@@ -648,13 +672,13 @@ function windowControllerService({ appServer, defaultWorkspace, logger, hub, ser
     const archived = Boolean(sess.archivedAt) || Boolean(m.archived);
     const phase = sess.phase ?? (sess.status === 'running' ? 'running' : 'completedSuccess');
     return {
-      address: { workspacePath: wsRoot, taskId: sess.sessionId },
+      address: { workspacePath: sessionWorkspacePath(sess), taskId: sess.sessionId },
       meta: {
         taskId: sess.sessionId,
         traceId: m.traceId ?? `zcode-${sess.sessionId}`,
         title: m.title ?? sess.title ?? 'Session',
         ...(m.titleOverridden ? { titleOverridden: true } : {}),
-        workspacePath: wsRoot,
+        workspacePath: sessionWorkspacePath(sess),
         createdAt: sess.createdAt ?? m.createdAt ?? Date.now(),
         updatedAt: sess.updatedAt ?? m.updatedAt ?? Date.now(),
         mode: sess.mode ?? 'build',
@@ -699,12 +723,19 @@ function windowControllerService({ appServer, defaultWorkspace, logger, hub, ser
   }
 
   if (hub) {
-    hub.onTaskListChanged((ev) => { fireDeltaFrames(ev?.reason, ev).catch(() => {}); });
+    hub.onTaskListChanged((ev) => {
+      // 任务变化 → 立刻失效 session 缓存，保证下一帧快照反映最新列表
+      sessionsCache.at = 0;
+      fireDeltaFrames(ev?.reason, ev).catch(() => {});
+    });
     // app-server sessions-index 增量 = 会话真实进入 session/list 的时刻（v4 createSession
     // 之后 sendText 才持久化）—— 此时重推 controller 快照，保证时间线即时可见
     hub.onSessionsIndexFrame?.((frame) => {
       const payload = frame?.frame?.payload ?? frame?.payload;
-      if (payload?.kind === 'deltas' || payload?.kind === 'snapshot') fireDeltaFrames('sessions_index', payload).catch(() => {});
+      if (payload?.kind === 'deltas' || payload?.kind === 'snapshot') {
+        sessionsCache.at = 0;
+        fireDeltaFrames('sessions_index', payload).catch(() => {});
+      }
     });
   }
 
@@ -720,7 +751,7 @@ function windowControllerService({ appServer, defaultWorkspace, logger, hub, ser
         traceId: m.traceId ?? `zcode-${s.sessionId}`,
         title: m.title ?? s.title ?? 'Session',
         ...(m.titleOverridden ? { titleOverridden: true } : {}),
-        workspacePath: wsRoot,
+        workspacePath: sessionWorkspacePath(s),
         createdAt: s.createdAt ?? Date.now(),
         updatedAt: s.updatedAt ?? Date.now(),
         mode: s.mode ?? 'build',
@@ -733,6 +764,9 @@ function windowControllerService({ appServer, defaultWorkspace, logger, hub, ser
         ...((m.archived || s.archivedAt) ? { archived: true } : {}),
       };
     });
+    // 按查询 scope 过滤：scope 匹配 task 的真实 workspacePath（无 scope 时回退全部/当前 wsRoot）
+    const scopePaths = scopes.map((sc) => (typeof sc === 'string' ? sc : sc?.workspacePath)).filter(Boolean);
+    if (scopePaths.length > 0) items = items.filter((t) => scopePaths.includes(t.workspacePath));
     if (kind === 'pinned') items = items.filter((t) => t.pinned);
     if (kind === 'archived') items = items.filter((t) => t.archived);
     if (kind === 'active' || kind === 'timeline') items = items.filter((t) => !t.archived && !t.pinned);
