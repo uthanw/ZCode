@@ -1,14 +1,15 @@
 # ZCode Web Service 运维手册（公网部署加固）
 
-> 服务当前以**无鉴权**状态运行在 `0.0.0.0:8080`（网关 NAT → 公网 `egent.de5.net:21673`）。
-> 以下加固项已实现/验证，按需开启。
+> 服务运行在 `0.0.0.0:8080`（网关 NAT → 公网 `egent.de5.net:21673`），
+> **token 鉴权已开启**（systemd drop-in 注入 `ZCODE_WEB_TOKEN`，见下文）。
+> 其余加固项已实现/验证，按需开启。
 
-## 一、Token 鉴权（已实现，待开启）
+## 一、Token 鉴权（已开启 ✅）
 
-服务端已支持 `ZCODE_WEB_TOKEN` 环境变量，覆盖三种访问方式（实现见 `server/web-server.mjs`）：
+服务端通过 `ZCODE_WEB_TOKEN` 环境变量开启鉴权，覆盖三种访问方式（实现见 `server/web-server.mjs`）：
 - HTTP 头：`Authorization: Bearer <token>`
-- Cookie：`zcode_web_token=<token>`（首次访问种下，之后浏览器自动携带）
-- URL 参数：`http://host:8080/?token=<token>`（首次访问入口）
+- Cookie：`zcode-web-token=<token>`（由登录门户 `POST /login` 种下，之后浏览器自动携带）
+- URL 参数：`http://host:8080/?token=<token>`（仅当次请求有效，**不种 cookie**）
 
 ### 开启步骤
 
@@ -35,7 +36,7 @@ curl -s -o /dev/null -w "%{http_code}\n" -H "Authorization: Bearer $TOKEN" http:
 
 浏览器访问：`http://egent.de5.net:21673/` —— 未认证会自动跳转 **登录门户**（shadcn 风格），
 粘贴 token 提交后服务端种下 HttpOnly cookie（30 天有效），后续访问无需再次输入。
-也可继续用 `http://egent.de5.net:21673/?token=<token>` 直达。
+`http://egent.de5.net:21673/?token=<token>` 也可直达，但该方式不种 cookie，仅当次有效。
 
 - 登录门户：`GET /login`（已登录访问会直接跳回工作台）
 - 登录接口：`POST /login`，JSON body `{"token":"<token>"}`，成功种 `zcode-web-token` HttpOnly cookie
@@ -47,7 +48,7 @@ WebSocket `/rpc` 同样要求鉴权（port-shim 自动从 cookie/URL 继承 toke
 回归脚本：`/tmp/ws-auth-test.mjs`（无 token WS 握手被拒、带 token 正常收发）、
 `/tmp/e2e-login-portal.mjs`（真实浏览器全流程：门户渲染 → 错误 token → 正确 token → 进工作台 → RPC 握手 → cookie 持久化）。
 
-### 关闭（回到当前测试模式）
+### 关闭鉴权（回到无鉴权测试模式）
 
 ```bash
 sudo rm /etc/systemd/system/zcode-web.service.d/token.conf
@@ -89,8 +90,8 @@ server {
 2. `ln -s /etc/nginx/sites-available/zcode-web.conf /etc/nginx/sites-enabled/ && nginx -t && systemctl reload nginx`
 3. 网关把新公网端口 NAT 到内网 8444。
 
-**强烈建议**：先开启第一章的 token 鉴权再暴露公网 —— 当前服务持有你的 DeepSeek API key，
-裸奔状态下任何知道地址的人都能消耗你的配额。
+**提醒**：token 鉴权已开启，但公网目前仍是明文 HTTP —— token 与 cookie 在传输中可被中间人截获，
+且服务持有你的 DeepSeek API key。要彻底加固，按本章配置 HTTPS 反代（并在开启后给 cookie 补 `Secure` 标记）。
 
 ## 三、进程守护（已开启 ✅）
 
