@@ -44,6 +44,18 @@ function entryOf(name, st, basePath) {
 // ---------- File ----------
 function fileService({ logger, workspaceRoot }) {
   return {
+    // 渲染器 Bet() 逆向: checkFilesExist({paths}) -> [{path, exists}]
+    // 用于上下文引用去重前的存在性批量校验（缺失文件引用直接过滤掉）
+    async checkFilesExist({ paths } = {}) {
+      const list = Array.isArray(paths) ? paths : [];
+      const out = [];
+      for (const p of list) {
+        if (typeof p !== 'string') { out.push({ path: String(p), exists: false }); continue; }
+        try { await fsp.stat(p); out.push({ path: p, exists: true }); }
+        catch { out.push({ path: p, exists: false }); }
+      }
+      return out;
+    },
     async stat({ path: p }) {
       if (typeof p !== 'string') throw new Error('stat: path required');
       const st = await fsp.lstat(p);
@@ -422,9 +434,14 @@ function gitService({ logger, workspaceRoot }) {
       const lines = porcelain.ok ? porcelain.stdout.split('\0').filter((l, idx) => idx === 0 || l) : [];
       const bodyLines = lines.slice(1);
       const isDirty = bodyLines.some((l) => l && !/^\?\? /.test(l));
+      const root0 = repoRoot.stdout.trim();
       const summary = {
-        workspacePath: ws, repoRoot: repoRoot.stdout.trim(), workspaceInRepoPath: inRepo.stdout.trim() || '.',
-        autoRefreshWatchPaths: [], branchName, trackingBranchName, headRefType: 'branch',
+        workspacePath: ws, repoRoot: root0, workspaceInRepoPath: inRepo.stdout.trim() || '.',
+        // autoRefreshWatchPaths: 渲染器 gyt hook 据此 watch 目录, 文件变更自动 refresh。
+        // 注意: 填实际路径 (曾试 [repoRoot, repoRoot/.git] 和 [workspacePath]) 均导致
+        // 渲染器 watch → GitPane 刷新链路失稳 (Ctrl+K 无响应、偶发 trim undefined 崩溃),
+        // 留空数组保稳定, 面板有手动「刷新」按钮兜底。
+        autoRefreshWatchPaths: [],
         ahead, behind, isDirty, isGitAvailable: true, isRepository: true,
       };
       // 变更列表 + 行数统计 (numstat: staged 用 --cached, unstaged 两者差集)
