@@ -652,7 +652,155 @@ function gitService({ logger, workspaceRoot }) {
   };
 }
 
-// ---------- FileWatcher（fs.watch 递归监听）----------
+// ---------- UsageStats（本地模型调用统计 — 解析 rollout JSONL）----------
+// 渲染器契约 (styles bundle _Vt/zBt/s7/lVt + AppUsage*Chart chunk 逆向):
+//   getAppUsageSnapshot({range:'7d'|'30d'|'all', timeZone}) -> snapshot
+//   snapshot = {
+//     range, generatedAt,
+//     summary: { totalTokens, peakDayTokens, longestSessionMs, currentStreakDays, longestStreakDays },
+//     heatmap: { weeks: [{ days: [null|{date, totalTokens, turnCount, toolCallCount}] }] },
+//     dailyModelUsage: [{ date, models: [{ modelId, totalTokens }] }],
+//     models: [{ modelId, totalTokens }],
+//   }
+// 数据源: ~/.zcode/cli/rollout/model-io-sess_*.jsonl — 每行一次模型调用
+//   { startedAt, model.modelId, response.usage.totalTokens, response.toolCalls.length,
+//     durationMs, sessionId }
+// Electron 原版读本地 sqlite; web 版直接扫 rollout 文件 (与服务同机, 数据一致)。
+function usageStatsService({ logger }) {
+  const ROLLOUT_DIR = path.join(os.homedir(), '.zcode', 'cli', 'rollout');
+  let cache = null; let cachedAt = 0; let cacheMtime = 0;
+  const TTL_MS = 30 * 1000;
+
+  function localDateKey(isoMs, timeZone) {
+    try {
+      return new Intl.DateTimeFormat('en-CA', { timeZone, year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date(isoMs));
+    } catch { return new Date(isoMs).toISOString().slice(0, 10); }
+  }
+
+  /** 读全部调用记录 (带 30s 缓存; 目录 mtime 变化即失效) */
+  function loadCalls() {
+    const now = Date.now();
+    let dirMtime = 0;
+    try {
+      dirMtime = fs.statSync(ROLLOUT_DIR).mtimeMs;
+      // 30s 内且目录未变 → 复用 (文件内容追加不改目录 mtime — 再抽查一个文件大小和):
+      if (cache && now - cachedAt < TTL_MS && dirMtime === cacheMtime) return cache;
+    } catch { return []; }
+    const calls = [];
+    try {
+      for (const name of fs.readdirSync(ROLLOUT_DIR)) {
+        if (!/^model-io-sess_.*\.jsonl$/.test(name)) continue;
+        let txt;
+        try { txt = fs.readFileSync(path.join(ROLLOUT_DIR, name), 'utf8'); } catch { continue; }
+        for (const line of txt.split('\n')) {
+          if (!line.trim()) continue;
+          let r;
+          try { r = JSON.parse(line); } catch { continue; }
+          const ts = r.startedAt ? Date.parse(r.startedAt) : NaN;
+          const total = Number(r?.response?.usage?.totalTokens);
+          if (!Number.isFinite(ts)) continue;
+          calls.push({
+            at: ts,
+            modelId: typeof r?.model?.modelId === 'string' ? r.model.modelId : 'unknown',
+            totalTokens: Number.isFinite(total) ? total : 0,
+            toolCalls: Array.isArray(r?.response?.toolCalls) ? r.response.toolCalls.length : 0,
+            durationMs: Number(r.durationMs) || 0,
+            sessionId: typeof r.sessionId === 'string' ? r.sessionId : null,
+          });
+        }
+      }
+    } catch (e) {
+      logger.warn?.('[usage-stats] 读取 rollout 失败:', e.message);
+    }
+    calls.sort((a, b) => a.at - b.at);
+    cache = calls; cachedAt = now; cacheMtime = dirMtime;
+    return calls;
+  }
+
+  return {
+    async getEntitlementSnapshot() { return { entitled: false }; },
+    async getUsage() { return { usage: {} }; },
+    async getAppUsageSnapshot({ range, timeZone } = {}) {
+      const calls = loadCalls();
+      const now = Date.now();
+      const rangeDays = range === '7d' ? 7 : range === '30d' ? 30 : null;
+      const from = rangeDays ? now - rangeDays * 86400000 : 0;
+      const scoped = calls.filter(c => c.at >= from);
+
+      // 按天聚合 (全部历史算 streak; range 只裁剪图表数据)
+      const byDayAll = new Map();
+      const byDayScoped = new Map();
+      const sessionMs = new Map();
+      const modelTotals = new Map();
+      const dailyModels = new Map();
+      for (const c of calls) {
+        const dk = localDateKey(c.at, timeZone);
+        let d = byDayAll.get(dk);
+        if (!d) { d = { date: dk, totalTokens: 0, turnCount: 0, toolCallCount: 0 }; byDayAll.set(dk, d); }
+        d.totalTokens += c.totalTokens; d.turnCount += 1; d.toolCallCount += c.toolCalls;
+        if (c.sessionId) sessionMs.set(c.sessionId, (sessionMs.get(c.sessionId) ?? 0) + c.durationMs);
+        const mt = modelTotals.get(c.modelId) ?? 0;
+        modelTotals.set(c.modelId, mt + c.totalTokens);
+        if (c.at >= from) {
+          let s = byDayScoped.get(dk);
+          if (!s) { s = { date: dk, totalTokens: 0, turnCount: 0, toolCallCount: 0 }; byDayScoped.set(dk, s); }
+          s.totalTokens += c.totalTokens; s.turnCount += 1; s.toolCallCount += c.toolCalls;
+          let dm = dailyModels.get(dk);
+          if (!dm) { dm = new Map(); dailyModels.set(dk, dm); }
+          dm.set(c.modelId, (dm.get(c.modelId) ?? 0) + c.totalTokens);
+        }
+      }
+
+      // streaks: 有使用的连续天数 (以本地日期)
+      const dayKeys = [...byDayAll.keys()].sort();
+      const todayKey = localDateKey(now, timeZone);
+      let longestStreak = 0, run = 0, prev = null;
+      for (const k of dayKeys) {
+        if (prev !== null) {
+          const gap = (Date.parse(k + 'T00:00:00Z') - Date.parse(prev + 'T00:00:00Z')) / 86400000;
+          run = gap === 1 ? run + 1 : 1;
+        } else run = 1;
+        if (run > longestStreak) longestStreak = run;
+        prev = k;
+      }
+      let currentStreak = 0;
+      if (dayKeys.length) {
+        // 从今天 (或最近的可用日) 往回数
+        let cursor = dayKeys[dayKeys.length - 1] === todayKey ? todayKey : dayKeys[dayKeys.length - 1];
+        for (let i = dayKeys.length - 1; i >= 0; i--) {
+          if (dayKeys[i] === cursor) { currentStreak += 1; cursor = localDateKey(Date.parse(cursor + 'T00:00:00Z') - 86400000, timeZone); }
+          else break;
+        }
+      }
+      const longestSessionMs = Math.max(0, ...(sessionMs.size ? [...sessionMs.values()] : [0]));
+      const scopedDays = [...byDayScoped.values()];
+      const peakDayTokens = Math.max(0, ...(scopedDays.length ? scopedDays.map(d => d.totalTokens) : [0]));
+      const totalTokens = scopedDays.reduce((s, d) => s + d.totalTokens, 0);
+
+      // heatmap: 渲染器 tVt 会把 weeks 按周重排, 只需提供按天 cell;
+      // 7 天一组塞进 weeks[].days (不足 7 天的尾周允许短数组 — tVt flatMap 兼容)
+      const ordered = [...byDayScoped.values()].sort((a, b) => (a.date < b.date ? -1 : 1));
+      const weeks = [];
+      for (let i = 0; i < ordered.length; i += 7) weeks.push({ days: ordered.slice(i, i + 7) });
+
+      const dailyModelUsage = [...dailyModels.entries()].sort(([a], [b]) => a < b ? -1 : 1)
+        .map(([date, models]) => ({ date, models: [...models.entries()].map(([modelId, totalTokens]) => ({ modelId, totalTokens })) }));
+      const models = [...modelTotals.entries()].map(([modelId, totalTokens]) => ({ modelId, totalTokens }))
+        .sort((a, b) => b.totalTokens - a.totalTokens);
+
+      return {
+        range: range ?? 'all',
+        generatedAt: now,
+        summary: { totalTokens, peakDayTokens, longestSessionMs, currentStreakDays: currentStreak, longestStreakDays: longestStreak },
+        heatmap: { weeks },
+        dailyModelUsage,
+        models,
+      };
+    },
+  };
+}
+
+
 // 渲染器契约 (styles bundle WorkspaceFileTree/GitAutoRefresh 逆向):
 //   watch({path, recursive?}) -> {id}
 //   unwatch({id}) -> void
@@ -1264,12 +1412,7 @@ function buildAllChannels({ appServer, workspaceRoot, logger, configPath }) {
     [CHANNELS.Broadcast]: broadcastService(),
     [CHANNELS.OAuth]: oauthService(),
     [CHANNELS.ModelProvider]: modelProviderService({ appServer, defaultWorkspace, configPath, logger }),
-    [CHANNELS.UsageStats]: {
-      async getEntitlementSnapshot() { return { entitled: false }; },
-      async getUsage() { return { usage: {} }; },
-      // 原版聚合本地/远端 usage 快照; web 版无订阅数据 → 空快照
-      async getAppUsageSnapshot() { return { snapshots: [], entitlement: null }; },
-    },
+    [CHANNELS.UsageStats]: usageStatsService({ logger }),
     [CHANNELS.CodingPlanSubscription]: {
       async getEnterprisePricing() { return null; },
       async getStatus() { return { active: false }; },
