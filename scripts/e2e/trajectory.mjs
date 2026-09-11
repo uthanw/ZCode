@@ -21,7 +21,11 @@ try {
       return { x: r.x + r.width/2, y: r.y + r.height/2 };
     })()`);
   }
-  if (!target) { await failExit('未找到任务'); }
+  if (!target) {
+    const dbg = await ev(client, `JSON.stringify([...document.querySelectorAll('[data-testid^=task-item-]')].slice(0, 8).map(e => (e.innerText||'').trim().split('\n')[0]))`);
+    console.log('dbg 任务列表前8:', dbg);
+    await failExit('未找到任务「请只回复: ok」');
+  }
   await click(client, target.x, target.y);
   let ok = false;
   for (let w = 0; w < 24; w++) {
@@ -29,6 +33,7 @@ try {
     const len = await ev(client, `document.querySelector('main')?.innerText?.length ?? 0`);
     if (len >= 120) { ok = true; break; }
   }
+  console.log('dbg transcript ok:', ok, 'len:', await ev(client, `document.querySelector('main')?.innerText?.length ?? 0`));
   if (!ok) { await failExit('transcript 未渲染'); }
 
   // 2. 找 appHeader 的任务菜单触发器: 任务标题旁的下拉按钮 (含 ellipsis svg / aria-haspopup)
@@ -50,6 +55,7 @@ try {
     await ev(client, `document.activeElement?.blur?.()`);
     await sleep(300);
   }
+  console.log('dbg menu opened:', opened, 'coords:', JSON.stringify(coords ?? []).slice(0, 200));
   if (!opened) {
     // 3. 兜底: 侧栏任务 item hover 出现的 ... 按钮
     const hoverBtn = await ev(client, `(() => {
@@ -72,6 +78,7 @@ try {
     const r = el.getBoundingClientRect();
     return { x: r.x + r.width/2, y: r.y + r.height/2 };
   })()`);
+  console.log('dbg menuitem 查看调用轨迹:', JSON.stringify(mi));
   if (!mi) { await failExit('菜单里没有「查看调用轨迹」'); }
   await click(client, mi.x, mi.y);
 

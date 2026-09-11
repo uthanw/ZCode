@@ -49,8 +49,12 @@ export async function launch({ port, profile, width = 1600, height = 900 } = {})
   return { send, on, kill };
 }
 
-/** 登录 + 打开主界面 */
-export async function loginAndOpen(client) {
+/** 登录 + 打开主界面 (内置真实用户让路检查) */
+export async function loginAndOpen(client, opts = {}) {
+  if (!opts.skipUserGuard) {
+    const clear = await assertNoActiveUser();
+    if (!clear) { console.log('FAIL  E2E 中止: 真实用户在线, 让路'); process.exit(3); }
+  }
   await client.send('Runtime.enable'); await client.send('Page.enable');
   await client.send('Page.navigate', { url: `${BASE}/login` });
   for (let i = 0; i < 15; i++) {
@@ -114,5 +118,35 @@ export async function palettePick(client, text, label) {
   })()`);
   if (!item) return false;
   await click(client, item.x, item.y);
+  return true;
+}
+
+/** 真实用户活跃检测 — E2E 让路。
+ *  964MB 小机上 chrome E2E 会挤压 node 服务, 导致真实用户 WS 心跳超时掉线
+ *  (13:18 实测: 用户重连风暴 395+354+157 帧重放)。E2E 前调用, 活跃则退出等待。 */
+export async function assertNoActiveUser({ quietMinutes = 4 } = {}) {
+  const fs = await import('node:fs');
+  const REAL_IP = '39.144.55.67';
+  try {
+    const log = fs.readFileSync('/tmp/web-server.log', 'utf8');
+    const lines = log.split('\n');
+    // 找最近一次真实用户活动行 (browser:ws from IP 或 rpc 会话活动)
+    let last = null;
+    for (let i = lines.length - 1; i >= 0; i--) {
+      if (lines[i].includes(REAL_IP)) { last = lines[i]; break; }
+    }
+    if (!last) return true;
+    const m = last.match(/\[web (\d{2}):(\d{2}):(\d{2})\]/);
+    if (!m) return true; // 无时间戳的老日志行, 视为陈旧
+    const [ , hh, mm, ss ] = m;
+    const now = new Date();
+    const t = hh * 3600 + mm * 60 + ss * 1;
+    const n = now.getHours() * 3600 + now.getMinutes() * 60 + now.getSeconds();
+    const ageMin = (n - t) / 60;
+    if (ageMin >= 0 && ageMin < quietMinutes) {
+      console.log(`SKIP  真实用户 ${ageMin.toFixed(1)} 分钟前仍活跃, E2E 让路 (等待或稍后重试)`);
+      return false;
+    }
+  } catch { /* 日志不可读时放行 */ }
   return true;
 }
