@@ -130,6 +130,37 @@ class AgentEventHub {
   }
 }
 
+// rollout wire 内容 → 渲染器 message.parts 形状
+function wireContentToParts(content) {
+  if (content == null) return [];
+  if (typeof content === 'string') return content ? [{ kind: 'text', text: content }] : [];
+  if (Array.isArray(content)) {
+    return content.map((b) => {
+      if (b == null) return null;
+      if (typeof b === 'string') return { kind: 'text', text: b };
+      if (b.type === 'text') return { kind: 'text', text: b.text ?? '' };
+      if (b.type === 'thinking') return { kind: 'reasoning', text: b.thinking ?? b.text ?? '' };
+      if (b.type === 'tool_use' || b.type === 'tool-call') return wireToolCallToPart(b);
+      if (b.type === 'tool_result' || b.type === 'tool-result') {
+        return { kind: 'tool-result', toolCallId: b.tool_call_id ?? b.toolCallId ?? null, output: b.content ?? b.output ?? null };
+      }
+      if (b.type === 'image') return { kind: 'image', source: b.source ?? null };
+      return { kind: 'text', text: JSON.stringify(b) };
+    }).filter(Boolean);
+  }
+  if (typeof content === 'object') return [{ kind: 'text', text: JSON.stringify(content) }];
+  return [{ kind: 'text', text: String(content) }];
+}
+
+function wireToolCallToPart(tc) {
+  return {
+    kind: 'tool-call',
+    toolCallId: tc.id ?? tc.toolCallId ?? tc.tool_call_id ?? null,
+    toolName: tc.name ?? tc.toolName ?? null,
+    input: tc.input ?? tc.arguments ?? null,
+  };
+}
+
 function normWs(p) {
   return { workspacePath: p?.workspacePath, workspaceIdentity: p?.workspaceIdentity, workspaceKey: p?.workspacePath };
 }
@@ -355,7 +386,59 @@ function buildZCodeTaskService({ appServer, defaultWorkspace, logger, services, 
     async getTaskSessionFilePath() { return { path: null, exists: false }; },
     async getTaskNativeSessionLogFile() { return { path: null, exists: false }; },
     // 原版读本地 model-io jsonl 轨迹文件; web 版暂无本地轨迹产物 → 空轨迹是合法形状
-    async getModelTrajectory() { return { records: [], sourceFiles: [], truncated: false }; },
+    // 模型调用轨迹: 读 app-server rollout 目录的 model-io jsonl (provider 请求/响应日志),
+    // 转成渲染器期望的 {records, sourceFiles, truncated} 形状。
+    // taskId 即 v4 会话 id (sess_xxx)。
+    async getModelTrajectory(p) {
+      const os = require('os');
+      const path = require('path');
+      const fsp = require('fs').promises;
+      const taskId = p?.taskId ?? p?.sessionId;
+      if (typeof taskId !== 'string' || !taskId.trim()) return { records: [], sourceFiles: [], truncated: false };
+      const dir = path.join(os.homedir(), '.zcode', 'cli', 'rollout');
+      const fileName = `model-io-${taskId}.jsonl`;
+      const filePath = path.join(dir, fileName);
+      let raw;
+      try { raw = await fsp.readFile(filePath, 'utf8'); }
+      catch { return { records: [], sourceFiles: [], truncated: false }; }
+      const records = [];
+      for (const line of raw.split('\n')) {
+        const t = line.trim();
+        if (!t) continue;
+        let r;
+        try { r = JSON.parse(t); } catch { continue; }
+        records.push({
+          requestId: r.requestId,
+          sessionId: r.sessionId ?? taskId,
+          turnId: r.turnId ?? null,
+          attempt: r.attempt ?? 1,
+          type: 'model_request',
+          querySource: r.querySource ?? 'main_turn',
+          startedAt: r.startedAt ?? null,
+          completedAt: r.completedAt ?? null,
+          durationMs: r.durationMs ?? null,
+          model: r.model ?? {},
+          callSource: { kind: r.querySource === 'subagent' ? 'subagent' : 'main', querySource: r.querySource ?? 'main_turn' },
+          request: {
+            messages: (r.request?.messages ?? []).map((m) => ({
+              role: m.role,
+              parts: wireContentToParts(m.content),
+            })),
+          },
+          response: r.response ? {
+            modelId: r.response.modelId ?? null,
+            responseId: r.response.responseId ?? null,
+            finishReason: r.response.finishReason ?? null,
+            text: r.response.text ?? null,
+            reasoningText: r.response.reasoningText ?? null,
+            toolCalls: (r.response.toolCalls ?? []).map((tc) => wireToolCallToPart(tc)),
+            usage: r.response.usage ?? null,
+          } : null,
+        });
+      }
+      records.sort((a, b) => String(a.startedAt ?? '').localeCompare(String(b.startedAt ?? '')));
+      return { records, sourceFiles: [fileName], truncated: false };
+    },
     // 注意：事件方法不能是 async —— fromService 的动态事件路径会把返回值当订阅函数调用，
     // async 函数返回 Promise，曾导致 "channel.listen(...) is not a function"。
     onDynamicWorkspaceEvent(arg) {

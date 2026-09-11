@@ -1057,6 +1057,10 @@ function buildAllChannels({ appServer, workspaceRoot, logger, configPath }) {
       async search() { return { results: [] }; },
       // 原版读本地 wiki/draft/task 摘要文件; web 版无本地 wiki 产物 → 各字段 null
       async readSummary() { return { wiki: null, draft: null, task: null }; },
+      // 渲染器 WikiReferenceSidePane 会订阅; web 版无 wiki 生成, 事件永不触发
+      onDidChangeRepoWiki() {
+        return new (require('../lib/rpc.js').Emitter)().event;
+      },
     },
     [CHANNELS.PromptAttachmentTransfer]: { async begin() { return { ok: false }; }, async chunk() { return { ok: false }; }, async commit() { return { ok: false }; } },
     [CHANNELS.OffPeakTask]: { async list() { return { tasks: [] }; } },
