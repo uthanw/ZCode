@@ -372,40 +372,88 @@ function gitService({ logger, workspaceRoot }) {
   };
 }
 
-// ---------- FileWatcher（轮询实现）----------
+// ---------- FileWatcher（fs.watch 递归监听）----------
+// 渲染器契约 (styles bundle WorkspaceFileTree/GitAutoRefresh 逆向):
+//   watch({path, recursive?}) -> {id}
+//   unwatch({id}) -> void
+//   onDynamicChange(id) -> ev {dirPath, ...}   ← 渲染器按 dirPath 重扫该目录
+// Electron host 用 chokidar; web 版直接用 node fs.watch (Linux inotify, 支持 recursive)。
 function fileWatcherService({ logger }) {
-  const emitters = new Map(); // watchId -> {emitter, paths, timer}
+  const emitters = new Map(); // id -> { emitter, watchers: fs.FSWatcher[], disposed }
   let nextId = 1;
+  const debounceTimers = new Map(); // id -> Map(dir -> timer)
   return {
-    async create({ paths, recursive }) {
+    async watch(p) {
+      const target = typeof p?.path === 'string' ? p.path : null;
+      if (!target) throw new Error('watch: path required');
+      const recursive = p?.recursive !== false; // 渲染器默认期望递归
       const id = String(nextId++);
       const em = new Emitter();
-      const snapshot = new Map();
-      const tick = async () => {
-        for (const p of paths || []) {
-          try {
-            const st = await fsp.stat(p);
-            const key = `${st.mtimeMs}:${st.size}`;
-            if (snapshot.has(p) && snapshot.get(p) !== key) {
-              em.fire({ path: p, kind: 'changed' });
-            }
-            snapshot.set(p, key);
-          } catch {
-            if (snapshot.has(p)) em.fire({ path: p, kind: 'removed' });
-            snapshot.delete(p);
-          }
+      const entry = { emitter: em, watchers: [], disposed: false };
+      emitters.set(id, entry);
+      // 事件合并: 同一目录 200ms 内的多次变更合并为一次 (inotify 重命名风暴会打爆渲染器)
+      const pend = new Map();
+      const fireDir = (dir) => {
+        let t = pend.get(dir);
+        if (t) return;
+        t = setTimeout(() => {
+          pend.delete(dir);
+          if (!entry.disposed) em.fire({ dirPath: dir, path: dir, kind: 'changed' });
+        }, 200);
+        pend.set(dir, t);
+      };
+      const attach = (dirPath) => {
+        try {
+          // 注意: fs.promises.watch 是 async-iterator 接口 (非 FSWatcher) — 用同步 callback 版 fs.watch
+          const w = fs.watch(dirPath, { recursive: recursive && process.platform === 'linux' }, (evt, filename) => {
+            if (entry.disposed) return;
+            // filename 可能是相对子路径 (递归模式) — 目录取其父目录
+            const rel = typeof filename === 'string' ? filename : '';
+            const abs = rel ? path.join(dirPath, rel) : dirPath;
+            fireDir(path.dirname(abs) || dirPath);
+          });
+          if (entry.disposed) { try { w.close(); } catch {} return; }
+          w.on('error', (e) => { logger.warn?.('[file-watcher] watch error:', dirPath, e.message); });
+          entry.watchers.push(w);
+        } catch (e) {
+          logger.warn?.('[file-watcher] 无法监听目录:', dirPath, e.message);
         }
       };
-      const timer = setInterval(tick, 1000);
-      emitters.set(id, { em, timer });
+      try {
+        const st = await fsp.stat(target);
+        attach(st.isDirectory() ? target : path.dirname(target));
+      } catch (e) {
+        // 目标不存在: 轮询等待其出现 (Electron chokidar 语义), 每 2s 探测, 出现后挂监听
+        const probe = setInterval(async () => {
+          if (entry.disposed) { clearInterval(probe); return; }
+          try {
+            const st2 = await fsp.stat(target);
+            clearInterval(probe);
+            attach(st2.isDirectory() ? target : path.dirname(target));
+            fireDir(st2.isDirectory() ? target : path.dirname(target));
+          } catch { /* 仍不存在 */ }
+        }, 2000);
+        entry.watchers.push({ close: () => clearInterval(probe) });
+      }
       return { id };
     },
-    async dispose({ id }) {
-      const w = emitters.get(id);
-      if (w) { clearInterval(w.timer); emitters.delete(id); }
+    async unwatch({ id }) {
+      const w = emitters.get(String(id));
+      if (w) {
+        w.disposed = true;
+        for (const fs of w.watchers) { try { fs.close(); } catch {} }
+        emitters.delete(String(id));
+      }
       return { ok: true };
     },
-    onDynamicChange(arg) { const w = emitters.get(arg?.id); return w ? w.em.event : new Emitter().event; },
+    onDynamicChange(arg) {
+      const id = typeof arg === 'string' ? arg : arg?.id;
+      const w = emitters.get(String(id));
+      return w ? w.emitter.event : new Emitter().event;
+    },
+    // 兼容旧轮询接口 (若有其他调用方)
+    async create(p) { return this.watch(p); },
+    async dispose({ id }) { return this.unwatch({ id }); },
   };
 }
 
@@ -882,6 +930,12 @@ function windowControllerService({ appServer, defaultWorkspace, logger, hub, ser
     async setBounds() {}, async focus() {}, async setFullScreen() {},
     // useGlobalTaskList (ag): {items,total,hasMore}
     async listTaskList(q) { return queryTaskList(q); },
+    // 渲染器启动能力探测 (偶发单次调用, 缺失仅 warn): 带版本的列表快照
+    async getTaskListSnapshot(q) {
+      const r = await queryTaskList(q);
+      const etag = `t${r.total}-${Date.now()}`;
+      return { snapshot: r, etag, notModified: false };
+    },
     async listControllerWorkspaces() { return { workspaces: [{ workspacePath: wsRoot, sourceAvailability: 'online', connectionState: 'online' }] }; },
     async listControllerTasks(q) { const r = await queryTaskList({ ...q, kind: q?.kind ?? 'timeline' }); return { tasks: r.items.map((t) => sessionToControllerTask({ sessionId: t.taskId, title: t.title, createdAt: t.createdAt, updatedAt: t.updatedAt, mode: t.mode, archivedAt: t.archivedAt })), total: r.total }; },
     // $ye registry: subscribe → {ack:{subscriptionId, mode:'snapshot', logEpoch}} + 初始快照帧

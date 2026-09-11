@@ -379,6 +379,9 @@ async function main() {
   let backendProbe = { at: 0, ok: false, error: '未探测' };
   let backendInflight = null;
   const BACKEND_TTL_MS = 3000;
+  // workspace 参数是对象（{workspacePath, workspaceKey}），传字符串会被 app-server 的
+  // zod schema 拒绝 —— 那样探针会永远报 down，等于把健康检查本身写成了故障源。
+  const PROBE_WORKSPACE = { workspacePath: WORKSPACE_ROOT, workspaceKey: WORKSPACE_ROOT };
   function probeBackend() {
     if (Date.now() - backendProbe.at < BACKEND_TTL_MS) return Promise.resolve(backendProbe);
     if (backendInflight) return backendInflight;
@@ -386,7 +389,7 @@ async function main() {
       let next;
       try {
         if (!appServer.proc || appServer.proc.exitCode !== null) throw new Error('app-server 进程已退出');
-        await appServer.request('workspace/readState', { workspace: WORKSPACE_ROOT }, { timeoutMs: 8000 });
+        await appServer.request('workspace/readState', { workspace: PROBE_WORKSPACE }, { timeoutMs: 8000 });
         next = { at: Date.now(), ok: true, error: '' };
       } catch (e) {
         next = { at: Date.now(), ok: false, error: String(e?.message || e).slice(0, 180) };
