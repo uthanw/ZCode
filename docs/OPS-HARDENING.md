@@ -116,6 +116,60 @@ tail -f /tmp/web-server.log           # 浏览器 beacon + RPC 诊断日志
 | 远程凭据 | `~/.zcode/web-ide-credentials.json` |
 | 会话/任务 | app-server 管理（`~/.zcode/` 下） |
 
+## 四B、可恢复 RPC 会话与连接指示器（已开启 ✅）
+
+### 机制概览
+
+渲染器入口有一次性闸门（`postMessage('zcode:service-port')` 只派发一次），
+ChannelClient 永久绑定 MessagePort，因此重连**不能换端口**，只能换端口底下的
+WebSocket；服务端同理必须保住同一个 ChannelServer，否则事件订阅全灭、UI 静默僵死。
+
+- **会话池**：`server/lib/resumable.js` 的 `ResumableSession` 按每次页面加载生成的
+  `cid` 常驻服务端（Map: cid → {session, protocol, channelServer}）。WS 断开 → detach
+  并进入宽限期缓冲出站帧；WS 重连带同一 `cid` → attach 并重放缺口。ChannelServer、
+  事件订阅（type=102 listen，`eventRequests` 追踪）、进行中请求全程存活。
+- **「连接成功」是业务层谓词**：WS readyState=OPEN 不算连上。port-shim 在宣布
+  「已连接」前必须完成一次真实 RPC 往返（`zcode-web-health.ping` channel），验证
+  ①app-server 子进程存活（服务端真实调 `workspace/readState`）②本会话事件订阅仍在
+  （`subscriptions > 0`）。两者任一不满足 → 显示「服务未就绪」（degraded）而非谎称已连接。
+- **双向帧序号 + ack + 重放**：两个方向各自给二进制帧编号；`?recv=N` 声明「已收到 N 帧」，
+  握手 hello 里回 `recv`；已确认帧才可从重放缓冲丢弃（每 32 帧或 3s 周期 ack）。
+  半开防护靠心跳超时（常规 12s、唤醒后 5s）主动断开换路，而非等 OS 通知。
+- **不可恢复 → 整页重载**：序号缺口 / 重放缓冲溢出（客户端 8MB/4000 帧、服务端
+  24MB/8000 帧）/ 宽限期超时 / 订阅全丢（`subscriptions-lost`）/ 服务重启
+  （`session-not-found`）→ 客户端明确收到 `resumed:false` 后整页重载。
+  宁可重载，也不要一个看起来正常、实际半死的界面。
+- **连接指示器**：Next.js devtools 徽标风格。内容区左下角（侧边栏 264px 之外）常驻
+  圆形徽标，正常时缩为半透明小点，状态变化时弹性放大高亮（busy 态带脉冲）；
+  点击展开浮动状态卡（状态文案/倒计时/延迟/订阅数/操作按钮），点外部或 Esc 收回。
+  Shadow DOM 隔离 + 应用 CSS 变量（`--color-card/--color-foreground/--radius-lg` 等），
+  明暗主题自动跟随。前端调试出口：`window.__zcodeNet`（stats/reconnect/health/drop）。
+
+### 控制帧协议（WS 文本帧；二进制帧一律是 RPC 负载）
+
+| 帧 | 方向 | 语义 |
+|---|---|---|
+| `{__zcodeRpcHello:'v1', cid, resumed, recv, reason?}` | 服务端→客户端 | 握手结果：是否恢复成功、服务端已收帧数 |
+| `{__zcodeRpcAck: N}` | 双向 | 我已收到 N 个二进制帧（对端可丢弃重放缓冲中 ≤N 的帧） |
+| `{__zcodeRpcPing: t}` / `{__zcodeRpcPong: t}` | 客户端→服务端 / 回 | 传输层心跳，超时视为半开主动换路 |
+
+WS 连接 URL：`/rpc?cid=<id>&recv=<已收帧数>&new=<0|1>&token=<token>`。
+
+### 环境变量
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `ZCODE_WEB_RESUME_GRACE_MS` | `600000` | 断开后会话保活时长（宽限期），超时未重连则销毁会话 |
+| `ZCODE_WEB_MAX_SESSIONS` | `64` | 会话池上限；超限优先淘汰已断开且最久未活动的会话 |
+
+### 回归脚本
+
+| 脚本 | 覆盖 |
+|---|---|
+| `scripts/e2e/test-codec.cjs` | port-shim 手写编解码器 vs `lib/rpc.js` serialize 字节级对拍（20 项） |
+| `scripts/e2e/test-resume-ws.cjs` | WS 级断线重连：首连握手/健康探针/订阅计数/断线恢复/缺口重放/不可恢复/心跳（20 项） |
+| `scripts/e2e/e2e-reconnect.mjs` | 真实浏览器 E2E：首载业务就绪、drop 重连、切后台恢复、degraded、服务重启自动重载、指示器交互（34 项） |
+
 ## 五、验证脚本清单
 
 | 脚本 | 覆盖 |

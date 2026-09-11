@@ -106,24 +106,41 @@ sudo systemctl daemon-reload && sudo systemctl restart zcode-web.service
 ├── bin/zcode.cjs          # vendored：ZCode CLI 打包产物（app-server 后端）
 ├── renderer/              # vendored：未修改的 Electron 渲染器产物（~58MB 构建资产）
 ├── server/
-│   ├── web-server.mjs     # 主服务器：静态托管 + 登录门户 + 压缩缓存 + WS /rpc
+│   ├── web-server.mjs     # 主服务器：静态托管 + 登录门户 + 压缩缓存 + WS /rpc + 会话池
 │   ├── inject/
-│   │   ├── port-shim.js   # 浏览器端注入：MessagePort → WebSocket 桥 + preload 桩
+│   │   ├── port-shim.js   # 浏览器端注入：MessagePort → WebSocket 桥（可恢复传输
+│   │   │                  #   + 业务就绪门 + 连接状态徽标）+ preload 桩
 │   │   └── login.html     # 令牌登录门户页
 │   ├── lib/
 │   │   ├── rpc.js         # 二进制 channel 协议（ChannelServer/VSBuffer/VQL 编解码）
+│   │   ├── resumable.js   # 可恢复 RPC 会话：按 cid 常驻、断线缓冲、重连重放
 │   │   └── zcode-app-server.js  # stdio JSON-RPC 客户端（app-server 子进程）
 │   └── services/
 │       ├── index.js       # 37 个 RPC channel 的装配与协议桥
 │       ├── agent-services.js    # File/System/Terminal/Git/Setting/... 通道实现
 │       └── v4-protocol.js       # V4 会话协议代理与流式帧转发
-├── scripts/serve.sh       # 守护启动脚本（崩溃重启 + 风暴保护）
-├── docs/OPS-HARDENING.md  # 运维加固手册（HTTPS 反代、防火墙、验证脚本清单）
+├── scripts/
+│   ├── serve.sh           # 守护启动脚本（崩溃重启 + 风暴保护）
+│   └── e2e/               # 回归测试：编解码对拍 / WS 断线重连 / 浏览器 E2E
+├── docs/OPS-HARDENING.md  # 运维加固手册（鉴权、HTTPS 反代、可恢复会话协议、脚本清单）
 └── workspace/             # 默认工作区（运行时用户数据，已 gitignore）
 ```
 
 `bin/` 与 `renderer/` 是从桌面版原样取出的产物，**不要手工修改**；本项目的全部
 自有逻辑都在 `server/` 下。
+
+## 断线重连与连接状态徽标
+
+渲染器的 MessagePort 一生只派发一次，因此重连不换端口、只换端口底下的
+WebSocket；服务端按 `cid` 保住同一个 ChannelServer（事件订阅、进行中请求全部存活）。
+「连接成功」是**业务层谓词**：WS 通了之后还要完成一次真实 RPC 往返
+（`zcode-web-health.ping`），确认 app-server 存活且事件订阅仍在，才宣布已连接；
+否则显示「服务未就绪」而非谎称连上。序号缺口、缓冲溢出、订阅丢失、服务重启等
+不可恢复情形一律整页重载。详见 `docs/OPS-HARDENING.md` §四B。
+
+界面左下角有一枚 Next.js devtools 风格的常驻徽标：正常时缩为半透明小点，
+断线/校验/未就绪时弹性放大高亮（带脉冲），点击展开浮动状态卡
+（延迟/订阅数/倒计时/重试按钮）。
 
 ## 性能与静态资源
 
@@ -151,5 +168,10 @@ renderer 资源总量约 58MB（最大单文件 4.5MB），服务端做了三层
   `POST /login` 无速率限制，建议配合反代限流。
 - `?token=` URL 参数会留在浏览器历史/服务端访问日志中，仅作入口便利，
   长效访问请用门户种 cookie。
+- 渲染器（只读 Electron bundle）的 code-viewer 组件对 `multi-file-diff` 类型
+  source 的 `beforeContent` 直接取 `.length`，而 app-server schema 允许
+  `beforeContent: null`（新建文件场景）。持久化的右侧面板 tab 恢复时若快照
+  数据不可用会触发一次 React 渲染错误（ErrorBoundary 兜底，不影响整体 UI）。
+  服务端无法修复只读渲染器，属上游 bug，升级 bundle 时关注。
 
 更多运维细节（HTTPS/nginx 配置模板、验证脚本清单）见 [docs/OPS-HARDENING.md](docs/OPS-HARDENING.md)。

@@ -153,12 +153,17 @@
 
 
   // ==========================================================================
-  // 连接状态指示器
+  // 连接状态指示器（Next.js devtools 徽标风格）
   // --------------------------------------------------------------------------
-  // 放在 Shadow DOM 里：自定义属性（--color-card 等）能穿透 shadow 边界继承进来，
-  // 所以能自动跟随 ZCode 明/暗主题；而应用的 Tailwind preflight 不会反过来污染它。
-  // 位置：顶部居中、标题栏（h-12）之下 —— 不与侧边栏标签/输入框抢地方，
-  // 连接正常时自动淡出，只在异常时常驻；右侧「–」可折叠为一个小圆点。
+  // 形态参考 Next.js 的浮动 debugger 徽标：内容区左下角一枚圆形徽标，
+  // 平时缩成半透明小点安静待命，状态变化时以弹性动画放大出现；
+  // 点击展开一张从徽标上方弹出的浮动状态卡（含副标题/倒计时/操作按钮），
+  // 点外部或再次点击徽标收回。整个组件在 Shadow DOM 里：自定义属性
+  // （--color-card 等）能穿透 shadow 边界继承，自动跟随 ZCode 明/暗主题；
+  // 而应用的 Tailwind preflight 不会反过来污染它。
+  //
+  // 位置：主内容区左下角（侧边栏 264px 之外），不与任何宿主元素抢位；
+  // 徽标常驻（连接正常时低调半透明），用户随时可点开查看连接详情。
   // ==========================================================================
   const Indicator = (function () {
     const TONE = {
@@ -166,8 +171,9 @@
       degraded: '#ff9f45', offline: '#ff5c5c',
       connected: '#2ecc8f', failed: '#ff5c5c', reloading: '#ff5c5c',
     };
-    let host = null, sr = null, wrap = null, pill = null, txtEl = null, subEl = null, actEl = null, chip = null;
-    let collapsed = false, hideTimer = null, showTimer = null;
+    let host = null, sr = null, wrap = null, badge = null, face = null,
+      panel = null, pTitle = null, pSub = null, pAct = null, pStats = null;
+    let open = false, spotlightTimer = null, showTimer = null;
     let cur = { state: 'idle', text: '', sub: '', action: null };
     let pendingRender = null;   // body 就绪前只保留最后一次状态，避免补播过期动画
 
@@ -175,68 +181,89 @@
 :host { all: initial; }
 * { box-sizing: border-box; }
 .wrap {
-  position: fixed; top: 56px; left: 0; right: 0;
-  display: flex; justify-content: center; align-items: flex-start;
+  position: fixed; left: 0; bottom: 0; right: 0;
   pointer-events: none;
   font-family: var(--font-sans, ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", sans-serif);
   font-feature-settings: "tnum" 1;
 }
-.pill, .chip {
+/* ---- 徽标：常驻圆点，状态变化时弹性放大 ---- */
+.badge {
   pointer-events: auto;
+  position: absolute; left: 280px; bottom: 14px;
+  width: 34px; height: 34px; border-radius: 999px;
+  display: grid; place-items: center; cursor: pointer;
   color: var(--color-foreground, #e7e7e7);
-  background: color-mix(in oklab, var(--color-card, #2b2b2b) 88%, transparent);
+  background: color-mix(in oklab, var(--color-card, #2b2b2b) 92%, transparent);
   border: 1px solid var(--color-border, rgba(255,255,255,.12));
-  box-shadow: 0 12px 32px -14px rgba(0,0,0,.6), 0 2px 6px -2px rgba(0,0,0,.3), inset 0 1px 0 color-mix(in oklab, var(--color-foreground, #fff) 6%, transparent);
+  box-shadow: 0 8px 24px -10px rgba(0,0,0,.55), 0 2px 6px -2px rgba(0,0,0,.3), inset 0 1px 0 color-mix(in oklab, var(--color-foreground, #fff) 6%, transparent);
   -webkit-backdrop-filter: blur(14px) saturate(180%);
   backdrop-filter: blur(14px) saturate(180%);
-  border-radius: 999px;
-  opacity: 0; transform: translateY(-12px) scale(.94);
-  transition: opacity .22s ease, transform .34s cubic-bezier(.22,1,.36,1);
+  /* 默认安静态：缩小 + 半透明；出现/状态活跃时弹回全尺寸 */
+  opacity: .5; transform: scale(.62);
+  transition: opacity .3s ease, transform .45s cubic-bezier(.34,1.56,.64,1);
   will-change: transform, opacity;
   -webkit-user-select: none; user-select: none;
 }
-.pill {
-  display: none; align-items: center; gap: 8px;
-  height: 30px; padding: 0 5px 0 11px;
-  font-size: 12.5px; line-height: 1; font-weight: 450; letter-spacing: .01em; white-space: nowrap;
-}
-.chip { display: none; width: 24px; height: 24px; align-items: center; justify-content: center; padding: 0; cursor: pointer; }
-.wrap[data-mode="pill"] .pill { display: inline-flex; }
-.wrap[data-mode="chip"] .chip { display: inline-flex; }
-.wrap[data-show="1"] .pill, .wrap[data-show="1"] .chip { opacity: 1; transform: translateY(0) scale(1); }
-.dot {
-  position: relative; flex: none; width: 7px; height: 7px; border-radius: 999px;
+.badge:hover { opacity: 1; }
+.wrap[data-attn="1"] .badge, .wrap[data-open="1"] .badge { opacity: 1; transform: scale(1); }
+.face { position: relative; width: 10px; height: 10px; border-radius: 999px;
   background: var(--tone, #f0a92a);
-  box-shadow: 0 0 0 3px color-mix(in oklab, var(--tone, #f0a92a) 20%, transparent);
+  box-shadow: 0 0 0 3px color-mix(in oklab, var(--tone, #f0a92a) 22%, transparent);
+  transition: transform .45s cubic-bezier(.34,1.56,.64,1);
+  flex: none;
 }
-.dot::after {
+.wrap[data-attn="1"] .face, .wrap[data-open="1"] .face { transform: scale(1.15); }
+.face::after {
   content: ""; position: absolute; inset: 0; border-radius: inherit; background: var(--tone, #f0a92a);
   opacity: 0;
 }
-.wrap[data-busy="1"] .dot::after { animation: zc-ping 1.7s cubic-bezier(0,0,.2,1) infinite; }
-@keyframes zc-ping { 0% { transform: scale(1); opacity: .55 } 70%, 100% { transform: scale(2.8); opacity: 0 } }
-.txt { max-width: 46vw; overflow: hidden; text-overflow: ellipsis; }
-.sub { color: var(--color-foreground-subtlest, color-mix(in oklab, currentColor 45%, transparent)); font-variant-numeric: tabular-nums; }
-.sub:empty { display: none; }
+.wrap[data-busy="1"] .face::after { animation: zc-ping 1.7s cubic-bezier(0,0,.2,1) infinite; }
+@keyframes zc-ping { 0% { transform: scale(1); opacity: .55 } 70%, 100% { transform: scale(2.6); opacity: 0 } }
+/* ---- 浮动状态卡：从徽标上方弹出 ---- */
+.panel {
+  pointer-events: auto;
+  position: absolute; left: 280px; bottom: 56px;
+  min-width: 250px; max-width: 380px;
+  padding: 11px 13px;
+  border-radius: var(--radius-lg, .5rem);
+  color: var(--color-foreground, #e7e7e7);
+  background: color-mix(in oklab, var(--color-card, #2b2b2b) 96%, transparent);
+  border: 1px solid var(--color-border, rgba(255,255,255,.12));
+  box-shadow: 0 24px 48px -16px rgba(0,0,0,.6), 0 4px 12px -4px rgba(0,0,0,.35), inset 0 1px 0 color-mix(in oklab, var(--color-foreground, #fff) 6%, transparent);
+  -webkit-backdrop-filter: blur(18px) saturate(180%);
+  backdrop-filter: blur(18px) saturate(180%);
+  opacity: 0; transform: translateY(10px) scale(.92);
+  transform-origin: 20px calc(100% + 22px);
+  transition: opacity .18s ease, transform .38s cubic-bezier(.22,1,.36,1);
+  will-change: transform, opacity;
+  visibility: hidden;
+  -webkit-user-select: none; user-select: none;
+}
+.wrap[data-open="1"] .panel {
+  opacity: 1; transform: translateY(0) scale(1); visibility: visible;
+}
+.wrap:not([data-open="1"]) .panel { pointer-events: none; }
+.p-head { display: flex; align-items: center; gap: 8px; }
+.p-head .face { width: 8px; height: 8px; }
+.p-title { flex: 1; min-width: 0; font-size: 12.5px; line-height: 1.35; font-weight: 550; letter-spacing: .01em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.p-sub { margin-top: 4px; font-size: 11.5px; line-height: 1.4; color: var(--color-foreground-subtlest, color-mix(in oklab, currentColor 45%, transparent)); font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.p-sub:empty { display: none; }
+.p-stats { margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--color-border, rgba(255,255,255,.08)); font-size: 10.5px; line-height: 1.5; color: var(--color-foreground-subtlest, color-mix(in oklab, currentColor 45%, transparent)); display: none; white-space: pre-line; }
+.p-stats:not(:empty) { display: block; }
+.p-actrow { margin-top: 8px; display: none; gap: 6px; }
+.p-actrow:not(:has(button[hidden])) { display: flex; }
 button { appearance: none; border: 0; background: transparent; font: inherit; color: inherit; cursor: pointer; padding: 0; }
 .act {
-  height: 22px; padding: 0 9px; margin-left: 2px; border-radius: 999px; font-size: 11.5px; font-weight: 500;
+  height: 24px; padding: 0 11px; border-radius: 999px; font-size: 11.5px; font-weight: 500;
   color: var(--color-foreground, #eee);
   background: color-mix(in oklab, var(--color-foreground, #fff) 9%, transparent);
   transition: background .15s ease;
 }
 .act:hover { background: color-mix(in oklab, var(--color-foreground, #fff) 17%, transparent); }
-.act:empty, .act[hidden] { display: none; }
-.min {
-  width: 22px; height: 22px; border-radius: 999px; display: grid; place-items: center;
-  color: var(--color-foreground-subtlest, color-mix(in oklab, currentColor 45%, transparent));
-  transition: background .15s ease, color .15s ease;
-}
-.min:hover { color: var(--color-foreground, #eee); background: var(--color-hover, color-mix(in oklab, var(--color-foreground, #fff) 9%, transparent)); }
-.min svg { display: block; }
+.act[hidden] { display: none; }
 @media (prefers-reduced-motion: reduce) {
-  .pill, .chip { transition: opacity .12s linear; transform: none !important; }
-  .wrap[data-busy="1"] .dot::after { animation: none; }
+  .badge, .face, .panel { transition: opacity .12s linear; transform: none !important; }
+  .wrap[data-busy="1"] .face::after { animation: none; }
 }`;
 
     function build() {
@@ -244,30 +271,36 @@ button { appearance: none; border: 0; background: transparent; font: inherit; co
       host = document.createElement('div');
       host.id = 'zcode-net-indicator';
       host.setAttribute('data-testid', 'net-indicator');
-      host.style.cssText = 'position:fixed;inset:0 0 auto 0;z-index:2147483646;pointer-events:none;';
+      host.style.cssText = 'position:fixed;inset:0;z-index:2147483646;pointer-events:none;';
       sr = host.attachShadow({ mode: 'open' });
       const style = document.createElement('style');
       style.textContent = CSS;
       wrap = document.createElement('div');
       wrap.className = 'wrap';
-      wrap.setAttribute('data-mode', 'pill');
+      wrap.setAttribute('data-attn', '0');
+      wrap.setAttribute('data-open', '0');
       wrap.innerHTML =
-        '<div class="pill" role="status" aria-live="polite">' +
-        '<span class="dot"></span><span class="txt"></span><span class="sub"></span>' +
-        '<button class="act" type="button"></button>' +
-        '<button class="min" type="button" title="隐藏" aria-label="隐藏连接指示器">' +
-        '<svg width="11" height="11" viewBox="0 0 12 12" fill="none" aria-hidden="true"><path d="M2.5 6h7" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>' +
-        '</button></div>' +
-        '<button class="chip" type="button" aria-label="显示连接状态"><span class="dot"></span></button>';
+        '<button class="badge" type="button" aria-label="连接状态">' +
+          '<span class="face"></span>' +
+        '</button>' +
+        '<div class="panel" role="status" aria-live="polite">' +
+          '<div class="p-head"><span class="face"></span><div class="p-title"></div></div>' +
+          '<div class="p-sub"></div>' +
+          '<div class="p-stats"></div>' +
+          '<div class="p-actrow"><button class="act" type="button" hidden></button></div>' +
+        '</div>';
       sr.append(style, wrap);
-      pill = wrap.querySelector('.pill');
-      txtEl = wrap.querySelector('.txt');
-      subEl = wrap.querySelector('.sub');
-      actEl = wrap.querySelector('.act');
-      chip = wrap.querySelector('.chip');
-      wrap.querySelector('.min').addEventListener('click', () => { collapsed = true; render(); });
-      chip.addEventListener('click', () => { collapsed = false; render(); });
-      actEl.addEventListener('click', () => { const a = cur.action; if (a && a.run) a.run(); });
+      badge = wrap.querySelector('.badge');
+      panel = wrap.querySelector('.panel');
+      pTitle = wrap.querySelector('.p-title');
+      pSub = wrap.querySelector('.p-sub');
+      pAct = wrap.querySelector('.act');
+      pStats = wrap.querySelector('.p-stats');
+      badge.addEventListener('click', (e) => { e.stopPropagation(); setOpen(!open); });
+      pAct.addEventListener('click', () => { const a = cur.action; if (a && a.run) a.run(); });
+      // 点面板外部 / Esc 收回
+      document.addEventListener('click', (e) => { if (open && !host.contains(e.target)) setOpen(false); }, true);
+      document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && open) setOpen(false); });
       document.body.appendChild(host);
       const f = pendingRender; pendingRender = null;
       if (f) f();
@@ -281,24 +314,30 @@ button { appearance: none; border: 0; background: transparent; font: inherit; co
       if (first) document.addEventListener('DOMContentLoaded', () => { build(); }, { once: true });
     }
 
+    /** 开合浮动状态卡。attn=1 时徽标全尺寸高亮；连接正常且面板关着则回落为安静小点。 */
+    function setOpen(v) {
+      open = v;
+      if (wrap) wrap.setAttribute('data-open', v ? '1' : '0');
+    }
+
     function render() {
       if (!wrap) return;
       const tone = TONE[cur.state] || '#f0a92a';
       const busy = cur.state === 'connecting' || cur.state === 'reconnecting' || cur.state === 'reloading' ||
         cur.state === 'syncing' || cur.state === 'degraded';
+      const calm = (cur.state === 'idle' || cur.state === 'connected') && !open;
       wrap.style.setProperty('--tone', tone);
       wrap.setAttribute('data-busy', busy ? '1' : '0');
-      wrap.setAttribute('data-mode', collapsed ? 'chip' : 'pill');
-      txtEl.textContent = cur.text;
-      subEl.textContent = cur.sub || '';
-      if (cur.action) { actEl.hidden = false; actEl.textContent = cur.action.label; }
-      else { actEl.hidden = true; actEl.textContent = ''; }
-      const title = cur.text + (cur.sub ? ' ' + cur.sub : '');
-      pill.title = title; chip.title = title;
-      if (host) { host.dataset.state = cur.state; host.dataset.text = title; }
+      wrap.setAttribute('data-attn', calm ? '0' : '1');
+      const title = cur.text || (cur.state === 'connected' ? '已连接' : '连接状态');
+      pTitle.textContent = title;
+      pSub.textContent = cur.sub || '';
+      if (cur.action) { pAct.hidden = false; pAct.textContent = cur.action.label; }
+      else { pAct.hidden = true; pAct.textContent = ''; }
+      badge.title = title + (cur.sub ? ' · ' + cur.sub : '');
+      badge.setAttribute('aria-label', title);
+      if (host) { host.dataset.state = cur.state; host.dataset.text = title + (cur.sub ? ' ' + cur.sub : ''); }
     }
-
-    function show(visible) { if (wrap) wrap.setAttribute('data-show', visible ? '1' : '0'); }
 
     return {
       /**
@@ -308,19 +347,32 @@ button { appearance: none; border: 0; background: transparent; font: inherit; co
       set(state, o) {
         o = o || {};
         cur = { state, text: o.text || '', sub: o.sub || '', action: o.action || null };
-        clearTimeout(hideTimer); clearTimeout(showTimer);
+        clearTimeout(spotlightTimer); clearTimeout(showTimer);
         try { window.dispatchEvent(new CustomEvent('zcode-net-state', { detail: { state, text: cur.text, sub: cur.sub } })); } catch {}
         whenReady(() => {
           render();
-          if (state === 'idle') { show(false); return; }
-          if (o.delayMs) { showTimer = setTimeout(() => { show(true); }, o.delayMs); }
-          else show(true);
-          if (o.autoHideMs) hideTimer = setTimeout(() => { show(false); collapsed = false; render(); }, o.autoHideMs);
+          if (state === 'idle') { setOpen(false); return; }
+          if (o.delayMs) { showTimer = setTimeout(() => render(), o.delayMs); }
+          // 状态切换时给徽标一次「聚光」：放大高亮一段时间，然后回落到安静态。
+          // autoHide 只取消聚光，徽标本身常驻不消失（Next.js devtools 徽标同款行为）。
+          const spotlightMs = o.autoHideMs || (state === 'connected' ? 2200 : 0);
+          if (spotlightMs) {
+            wrap.setAttribute('data-attn', '1');
+            spotlightTimer = setTimeout(() => { render(); }, spotlightMs);
+          }
         });
       },
       /** 仅更新副标题（倒计时），不重置动画。 */
-      sub(text) { cur.sub = text; if (subEl) { subEl.textContent = text; if (host) host.dataset.text = cur.text + ' ' + text; } },
-      get current() { return { state: cur.state, text: cur.text, sub: cur.sub, collapsed }; },
+      sub(text) {
+        cur.sub = text;
+        if (pSub) pSub.textContent = text;
+        if (host) host.dataset.text = (cur.text || '连接状态') + ' ' + text;
+      },
+      /** 面板详情区（stats 快照，面板打开时可见）。 */
+      stats(text) { if (pStats) pStats.textContent = text || ''; },
+      get current() { return { state: cur.state, text: cur.text, sub: cur.sub, open }; },
+      /** 测试/调试用：直接控制面板开合。 */
+      setOpen,
     };
   })();
 
@@ -344,6 +396,7 @@ button { appearance: none; border: 0; background: transparent; font: inherit; co
   const HEALTH_INTERVAL_MS = 60000; // 业务层健康巡检
   const HEALTH_TIMEOUT_MS = 12000;
   const DEGRADED_RETRY_MS = 3000;
+  const BUSY_LIMIT = 10;         // 后端「忙」宽限轮数上限（10 轮 × 3s ≈ 30s 预热窗口）
   const DEGRADED_GIVEUP_MS = 120000;
   const HELLO_TIMEOUT_MS = 15000;   // 连上后迟迟收不到握手 → 视为坏连接
   const READY_DISPATCH_FALLBACK_MS = 8000; // 后端未就绪时也别把界面永远卡在启动图上
@@ -427,7 +480,7 @@ button { appearance: none; border: 0; background: transparent; font: inherit; co
     let stopped = false;            // 准备整页重载，停止一切重连
     let retryTimer = null, retryAt = 0, countdownTimer = null;
     let pingTimer = null, pongDeadline = 0, helloTimer = null;
-    let healthTimer = null, degradedSince = 0, lastHealth = null, peakSubs = 0, verifySeq = 0;
+    let healthTimer = null, degradedSince = 0, lastHealth = null, peakSubs = 0, verifySeq = 0, busyStreak = 0;
     let portDispatched = false, domReady = false, helloSeen = false, dispatchFallback = null;
 
     // ---- 状态机 → 指示器 ----------------------------------------------------
@@ -608,6 +661,25 @@ button { appearance: none; border: 0; background: transparent; font: inherit; co
       }
       lastHealth = r;
 
+      // 后端忙碌（readState 暂时排不上队，但进程活着）→ 保持 syncing 继续等，
+      // 不算 degraded —— 谎报「服务未就绪」和谎报「已连接」一样糟糕。
+      // 但忙碌宽限有上限：连续 BUSY_LIMIT 轮后照常走 degraded 流程，防止永远卡在预热。
+      if (r.appServer === 'ok' && r.appServerBusy) {
+        busyStreak += 1;
+        if (busyStreak < BUSY_LIMIT) {
+          setState('syncing', {
+            text: everReady ? '连接已恢复 · 正在校验会话' : '正在同步会话',
+            sub: '后端正在预热…',
+            delayMs: everReady ? 0 : 1200,
+          });
+          clearTimeout(healthTimer);
+          healthTimer = setTimeout(() => verifyBusiness(true), DEGRADED_RETRY_MS);
+          armDispatchFallback();
+          return;
+        }
+      } else {
+        busyStreak = 0;
+      }
       if (r.appServer !== 'ok') { enterDegraded(r); return; }
 
       // 业务状态一致性：重连前有订阅、重连后一个都不剩 → 渲染器的事件流已经全死，
@@ -621,6 +693,11 @@ button { appearance: none; border: 0; background: transparent; font: inherit; co
       const wasReady = ready;
       ready = true;
       degradedSince = 0;
+      // 面板详情：真实往返延迟 + 会话/订阅快照，点开徽标即可看到
+      try {
+        Indicator.stats('会话 ' + cid + ' · 延迟 ' + (Date.now() - (r.echo || Date.now())) + 'ms\n' +
+          '订阅 ' + r.subscriptions + ' · 通道 ' + r.channels + ' · 发送 ' + sentSeq + ' / 接收 ' + recvSeq + ' 帧');
+      } catch {}
       if (!wasReady) announceReady();
       everReady = true;
       scheduleHealthCheck();

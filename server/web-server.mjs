@@ -337,7 +337,7 @@ const server = http.createServer(async (req, res) => {
     req.on('end', () => {
       try {
         const r = JSON.parse(body);
-        logger.info(`[browser:${r.kind}] ${r.msg}${r.extra ? '\n    ' + String(r.extra).split('\n').slice(0, 12).join('\n    ') : ''}`);
+        logger.info(`[browser:${r.kind}] (from ${req.socket.remoteAddress}) ${r.msg}${r.extra ? '\n    ' + String(r.extra).split('\n').slice(0, 12).join('\n    ') : ''}`);
       } catch { logger.warn('[browser] 无法解析调试回传:', body.slice(0, 200)); }
       res.writeHead(204); res.end();
     });
@@ -388,12 +388,29 @@ async function main() {
     backendInflight = (async () => {
       let next;
       try {
-        if (!appServer.proc || appServer.proc.exitCode !== null) throw new Error('app-server 进程已退出');
-        await appServer.request('workspace/readState', { workspace: PROBE_WORKSPACE }, { timeoutMs: 8000 });
-        next = { at: Date.now(), ok: true, error: '' };
+        // 进程死亡是硬事实，直接判 down —— 这一条不受下面「忙碌」宽限影响。
+        // 注意: 被 signal 杀死的子进程 exitCode === null (死因记在 signalCode)，
+        // 只查 exitCode 会对「被杀」永远误判存活 → 探针一路 busy、前端永远 syncing。
+        const proc = appServer.proc;
+        if (!proc || proc.exitCode !== null || proc.signalCode !== null) {
+          throw new Error(proc ? `app-server 进程已退出 (signal=${proc.signalCode ?? ''} code=${proc.exitCode ?? ''})` : 'app-server 未启动');
+        }
+        try {
+          await appServer.request('workspace/readState', { workspace: PROBE_WORKSPACE }, { timeoutMs: 8000 });
+          next = { at: Date.now(), ok: true, error: '' };
+        } catch (e) {
+          // 超时 ≠ 宕机：app-server 冷启动/高负载时 readState 可能暂时排不上队，
+          // 进程还活着就只报「忙」，让前端保持 syncing 继续等，而不是谎报 degraded。
+          const msg = String(e?.message || e);
+          if (/timeout/i.test(msg)) next = { at: Date.now(), ok: true, busy: true, error: '' };
+          else throw e;
+        }
       } catch (e) {
         next = { at: Date.now(), ok: false, error: String(e?.message || e).slice(0, 180) };
       }
+      // 「忙」结果不进缓存（或只留极短 TTL）：否则客户端 3s 重试会一直命中缓存的
+      // busy 结果，与探针缓存互相锁死，永远停在 syncing。
+      if (next.busy) next.at = Date.now() - BACKEND_TTL_MS + 1000;
       backendProbe = next;
       backendInflight = null;
       return next;
@@ -410,6 +427,7 @@ async function main() {
           ts: Date.now(),
           echo: arg && arg.t,
           appServer: backend.ok ? 'ok' : 'down',
+          appServerBusy: !!backend.busy,
           appServerError: backend.ok ? undefined : backend.error,
           // 本会话在服务端真实存活的**事件订阅**数（不含进行中的一次性请求）
           subscriptions: channelServer.eventRequests.size,
