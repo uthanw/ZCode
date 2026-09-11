@@ -850,9 +850,13 @@ button { appearance: none; border: 0; background: transparent; font: inherit; co
 
       const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
       const tok = new URLSearchParams(location.search).get('token');
+      // ephemeral=1（页面 URL 透传）：一次性会话（E2E/自动化），断开 15s 即销毁，
+      // 不占 10 分钟保活池，避免密集自动化把真实用户会话挤掉。
+      const eph = new URLSearchParams(location.search).get('ephemeral');
       let url = proto + '//' + location.host + '/rpc?cid=' + encodeURIComponent(cid) +
         '&recv=' + recvSeq + '&new=' + (established ? '0' : '1');
       if (tok) url += '&token=' + encodeURIComponent(tok);
+      if (eph === '1') url += '&ephemeral=1';
 
       let sock;
       try { sock = new WebSocket(url); } catch (e) { beacon('error', 'WebSocket 构造失败: ' + e.message); scheduleRetry(); return; }

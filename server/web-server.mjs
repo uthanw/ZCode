@@ -527,9 +527,12 @@ async function main() {
 
     evictIfNeeded();
     logger.info(`RPC 客户端已连接 cid=${cid} ${req.socket.remoteAddress}`);
+    // ephemeral=1：一次性会话（E2E/探针），断开即销毁，不占 10 分钟保活池——
+    // 防止密集 E2E 把真实用户会话从 64 上限里挤掉（曾致用户被迫整页重载）。
+    const ephemeral = url.searchParams.get('ephemeral') === '1';
     const session = new ResumableSession({
-      cid, logger, graceMs: RESUME_GRACE_MS,
-      onExpire: () => destroySession(cid, '宽限期超时'),
+      cid, logger, graceMs: ephemeral ? 15 * 1000 : RESUME_GRACE_MS,
+      onExpire: () => destroySession(cid, ephemeral ? '临时会话已断开' : '宽限期超时'),
     });
     const protocol = new MessagePortProtocol(session);
     const channelServer = new ChannelServer(protocol, null, 1000, true /*deferInit*/);

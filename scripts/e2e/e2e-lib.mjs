@@ -62,7 +62,8 @@ export async function loginAndOpen(client) {
     expression: `fetch('/login', { method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify({token:'${TOKEN}'}) }).then(r=>r.text())`,
     returnByValue: true, awaitPromise: true,
   });
-  await client.send('Page.navigate', { url: `${BASE}/` });
+  // ephemeral=1：E2E 页面会话断开 15s 即回收，不占 10 分钟保活池（防挤掉真实用户会话）
+  await client.send('Page.navigate', { url: `${BASE}/?ephemeral=1` });
 }
 
 /** eval 便捷封装 */
