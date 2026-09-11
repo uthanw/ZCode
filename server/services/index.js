@@ -1506,7 +1506,83 @@ function buildAllChannels({ appServer, workspaceRoot, logger, configPath }) {
       async updatePluginMarketplace(p) { return appServer.request('plugins/marketplace/update', { workspace: normWorkspace(p), ...(p.marketplace ? { marketplace: p.marketplace } : {}) }, { timeoutMs: 180000 }); },
       onDynamicPluginOperationProgress: () => new Emitter().event,
     },
-    [CHANNELS.Subagents]: { async list() { return { subagents: [] }; } },
+    // ---------- Subagents（设置页子智能体 tab） ----------
+    // 渲染器: H.list({workspacePath,workspaceIdentity,provider}) → eHt(e) =
+    // [...e.agents.filter(a=>a.source!=='plugin'), ...e.pluginAgents] + e.capability
+    //   H.setEnabled({agentId,enabled}) / H.updateAgent / H.createAgent / H.deleteAgent
+    // built-in 两个 (general-purpose, Explore) + workspace .zcode/agents/*.md 扫描;
+    // app-server 无 subagents RPC —— 服务端合成, 写操作落 web state 标记。
+    [CHANNELS.Subagents]: (() => {
+      const BUILTINS = [
+        { id: 'builtin:general-purpose', name: 'general-purpose', description: '通用子智能体, 适合需要多步骤、搜索与工具调用的复杂任务', scope: 'built-in', source: 'built-in', readOnly: true, enabled: true },
+        { id: 'builtin:explore', name: 'Explore', description: '只读探索子智能体, 用于代码库调研与信息收集', scope: 'built-in', source: 'built-in', readOnly: true, enabled: true },
+      ];
+      let wsCache = null; let wsCacheAt = 0; let wsCacheDir = '';
+      const scanWorkspaceAgents = async (workspacePath) => {
+        if (!workspacePath) return [];
+        if (wsCacheDir === workspacePath && Date.now() - wsCacheAt < 30000) return wsCache;
+        const out = [];
+        try {
+          const dir = path.join(workspacePath, '.zcode', 'agents');
+          const ents = await fsp.readdir(dir, { withFileTypes: true }).catch(() => []);
+          for (const ent of ents) {
+            if (!ent.isFile() || !ent.name.endsWith('.md')) continue;
+            const id = `workspace:${ent.name}`;
+            let description = '';
+            try {
+              const raw = await fsp.readFile(path.join(dir, ent.name), 'utf8');
+              const m = raw.match(/^---[\s\S]*?description:\s*(.+)$/m);
+              if (m) description = m[1].trim().replace(/^["']|["']$/g, '');
+            } catch {}
+            out.push({ id, name: ent.name.replace(/\.md$/, ''), description, path: path.join(dir, ent.name), scope: 'workspace', source: 'user', readOnly: false, enabled: true });
+          }
+        } catch {}
+        wsCache = out; wsCacheAt = Date.now(); wsCacheDir = workspacePath;
+        return out;
+      };
+      const disabledSet = async () => {
+        const st = await loadWebState();
+        return new Set(Array.isArray(st.subagentsDisabled) ? st.subagentsDisabled : []);
+      };
+      const allAgents = async (p) => {
+        const off = await disabledSet();
+        const wsAgents = await scanWorkspaceAgents(p?.workspacePath);
+        return [...BUILTINS, ...wsAgents].map((a) => ({ ...a, enabled: a.enabled !== false && !off.has(a.id) }));
+      };
+      return {
+        async list(p) {
+          const agents = await allAgents(p);
+          return { agents, pluginAgents: [], capability: { supported: true } };
+        },
+        async getAgent(p) {
+          const agents = await allAgents(p);
+          return agents.find((a) => a.id === (p?.agentId ?? p?.id)) ?? null;
+        },
+        async setEnabled(p) {
+          const off = await disabledSet();
+          const id = p?.agentId;
+          if (typeof id === 'string' && id) {
+            if (p?.enabled === false) off.add(id); else off.delete(id);
+            const st = await loadWebState();
+            st.subagentsDisabled = [...off];
+            await saveWebState(st);
+          }
+          return { ok: true };
+        },
+        async deleteAgent(p) {
+          // workspace 级用户 agent: 直接删 .md 文件; built-in 仅做禁用标记
+          const agents = await allAgents(p);
+          const a = agents.find((x) => x.id === p?.agentId);
+          if (a?.path?.endsWith('.md') && a.source === 'user') {
+            try { await fsp.unlink(a.path); wsCacheAt = 0; return { ok: true }; } catch {}
+          }
+          return this.setEnabled({ ...p, enabled: false });
+        },
+        async updateAgent() { return { ok: true }; },
+        async createAgent() { return { ok: true }; },
+        async setBuiltInModelOverride() { return { ok: true }; },
+      };
+    })(),
     [CHANNELS.Commands]: { async list() { return { commands: [] }; }, async updateCommandFile() { return { ok: true }; }, async writeCommandFile() { return { ok: true }; } },
     [CHANNELS.Hooks]: { async listHooks() { return { hooks: [] }; }, async loadHooks() { return { hooks: [] }; } },
     [CHANNELS.Memory]: { async loadMemory() { return { memory: null }; }, async saveMemory() { return { ok: true }; } },
