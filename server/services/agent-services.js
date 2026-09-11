@@ -205,15 +205,43 @@ function buildZodeSessionService({ appServer, defaultWorkspace, logger, hub }) {
 function buildZCodeTaskService({ appServer, defaultWorkspace, logger, services, hub }) {
   const taskMetaCache = new Map(); // sessionId -> meta fields (title, createdAt...)
 
+  // per-workspace session/list 缓存: 页面刷新时渲染器对每个打开的 workspace tab 并发调
+  // listTasks/listArchivedTasks/listPinnedTasks (3×N 次 session/list)，曾把 app-server
+  // 打出 30s 超时风暴 (08:13 一次 7 个超时)。TTL 短缓存 + 在途去重 + 失败回退旧数据。
+  const wsSessionsCache = new Map(); // workspacePath -> {at, promise, data}
+  const WS_TTL_MS = 5000;
   async function listSessions(p) {
-    try {
-      const res = await appServer.request('session/list', {
-        workspace: normWs(p),
-        includeArchived: true,
-        limit: 500, // app-server 默认 50，会截断长会话列表
-      }, { timeoutMs: 30000 });
-      return res.sessions ?? [];
-    } catch (e) { logger.warn?.('session/list failed:', e.message); return []; }
+    const wsPath = (typeof p?.workspacePath === 'string' && p.workspacePath) ? p.workspacePath : null;
+    const key = wsPath ?? '(default)';
+    const now = Date.now();
+    let entry = wsSessionsCache.get(key);
+    if (!entry) { entry = { at: 0, promise: null, data: null }; wsSessionsCache.set(key, entry); }
+    if (entry.data && now - entry.at < WS_TTL_MS) return entry.data;
+    if (entry.promise) return entry.promise;
+    entry.promise = (async () => {
+      try {
+        const res = await appServer.request('session/list', {
+          workspace: normWs(p),
+          includeArchived: true,
+          limit: 500, // app-server 默认 50，会截断长会话列表
+        }, { timeoutMs: 60000 });
+        entry.data = res.sessions ?? [];
+        entry.at = Date.now();
+        return entry.data;
+      } catch (e) {
+        logger.warn?.('session/list failed:', e.message);
+        return entry.data ?? [];
+      } finally { entry.promise = null; }
+    })();
+    return entry.promise;
+  }
+  // 任务列表变化时让对应 workspace 的缓存立即过期（TTL 内也强制重拉）
+  if (hub) {
+    hub.onTaskListChanged((ev) => {
+      const key = (typeof ev?.workspacePath === 'string' && ev.workspacePath) ? ev.workspacePath : null;
+      const e = wsSessionsCache.get(key ?? '(default)');
+      if (e) e.at = 0;
+    });
   }
 
   function sessionToTaskIndex(sess, workspacePath) {
@@ -347,10 +375,17 @@ function buildZCodeAgentService({ appServer, defaultWorkspace, logger, configPat
   });
   return {
     ...v4,
-    // 原版 host syncAppRuntimePreferences: 存内存 + 推给 app-server 两个偏好接口。
-    // web 版单进程 → 直接转发即可（失败不致命，只 warn）。
+    // 原版 host syncAppRuntimePreferences: 存内存 + 推给所有已连接 workspace 的 app-server。
+    // 渲染器只传 {askUserQuestionAutoResolutionEnabled, modelIoFullRetentionEnabled} (无 workspace)
+    // → 服务端补 default workspace; app-server schema strict:
+    //   interaction: preferences {askUserQuestionAutoResolutionEnabled}
+    //   modelIo:     preferences {fullRetentionEnabled}  ← 键名与渲染器不同!
     async syncAppRuntimePreferences(p) {
-      const ws = normWs(p);
+      // defaultWorkspace 在本 builder 里是 string (workspacePath)
+      const wsPath = (typeof p?.workspacePath === 'string' && p.workspacePath)
+        ? p.workspacePath
+        : (typeof defaultWorkspace === 'string' ? defaultWorkspace : defaultWorkspace?.workspacePath);
+      const ws = { workspacePath: wsPath, workspaceKey: wsPath };
       const jobs = [];
       if (p?.askUserQuestionAutoResolutionEnabled !== undefined) {
         jobs.push(appServer.request('workspace/updateInteractionPreferences', {
@@ -361,7 +396,7 @@ function buildZCodeAgentService({ appServer, defaultWorkspace, logger, configPat
       if (p?.modelIoFullRetentionEnabled !== undefined) {
         jobs.push(appServer.request('workspace/updateModelIoPreferences', {
           workspace: ws,
-          preferences: { modelIoFullRetentionEnabled: p.modelIoFullRetentionEnabled === true },
+          preferences: { fullRetentionEnabled: p.modelIoFullRetentionEnabled === true },
         }, { timeoutMs: 30000 }).catch((e) => logger.warn?.('updateModelIoPreferences failed:', e.message)));
       }
       await Promise.all(jobs);
