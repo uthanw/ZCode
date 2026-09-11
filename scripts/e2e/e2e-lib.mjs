@@ -1,0 +1,81 @@
+// 共享 CDP/WS E2E 基建 —— zcode-web-service 回归套件
+// 用法: import { withPage } from './e2e-lib.mjs'
+import { createRequire } from 'node:module';
+import { spawn } from 'node:child_process';
+import { setTimeout as sleep } from 'node:timers/promises';
+
+export const NODE = '/root/.nvm/versions/node/v22.23.2/bin/node';
+export const CHROME = '/root/.cache/chrome-hs/chrome-headless-shell-linux64/chrome-headless-shell';
+export const BASE = 'http://127.0.0.1:8080';
+export const TOKEN = 'Ij88036082!!';
+
+export function requireFromService(name) {
+  const req = createRequire('/root/zcode-web-service/package.json');
+  return req(name);
+}
+
+/** 起一个干净 chrome-headless-shell 并连接 CDP */
+export async function launch({ port, profile, width = 1600, height = 900 } = {}) {
+  const WebSocket = requireFromService('ws');
+  // 端口被占 (上次孤儿) → 直接失败, 避免连上死页面挂死
+  try {
+    const occupied = await fetch(`http://127.0.0.1:${port}/json/version`, { signal: AbortSignal.timeout(800) });
+    if (occupied.ok) throw new Error(`E2E port ${port} 已被占用 (孤儿 chrome?): 先清理`);
+  } catch (e) { if (e.message?.includes('已被占用')) throw e; }
+  const proc = spawn(CHROME, [
+    '--headless', '--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage',
+    `--user-data-dir=${profile}`, `--remote-debugging-port=${port}`,
+    `--window-size=${width},${height}`, 'about:blank',
+  ], { stdio: ['ignore', 'pipe', 'pipe'] });
+  let err = ''; proc.stderr.on('data', (d) => { err += d; });
+  const t0 = Date.now();
+  while (Date.now() - t0 < 15000) { if (err.includes('DevTools listening')) break; await sleep(200); }
+  const targets = await fetch(`http://127.0.0.1:${port}/json/list`).then((r) => r.json());
+  const ws = new WebSocket(targets.find((t) => t.type === 'page').webSocketDebuggerUrl, { perMessageDeflate: false, maxPayload: 256 * 1024 * 1024 });
+  await new Promise((res, rej) => { ws.on('open', res); ws.on('error', rej); });
+  let id = 0; const cbs = new Map(); const subs = new Set();
+  ws.on('message', (raw) => {
+    const msg = JSON.parse(raw.toString());
+    if (msg.id && cbs.has(msg.id)) { cbs.get(msg.id)(msg); cbs.delete(msg.id); }
+    else if (msg.method) { for (const h of [...subs]) h(msg); }
+  });
+  const send = (method, params = {}) => new Promise((res, rej) => {
+    const i = ++id;
+    cbs.set(i, (m) => { if (m.error) rej(new Error(JSON.stringify(m.error).slice(0, 300))); else res(m.result); });
+    ws.send(JSON.stringify({ id: i, method, params }));
+  });
+  const on = (h) => subs.add(h);
+  const kill = () => { try { proc.kill('SIGKILL'); } catch {} ws.close(); };
+  return { send, on, kill };
+}
+
+/** 登录 + 打开主界面 */
+export async function loginAndOpen(client) {
+  await client.send('Runtime.enable'); await client.send('Page.enable');
+  await client.send('Page.navigate', { url: `${BASE}/login` });
+  for (let i = 0; i < 15; i++) {
+    await sleep(600);
+    const { result } = await client.send('Runtime.evaluate', { expression: `!!document.querySelector('input')`, returnByValue: true });
+    if (result?.value) break;
+  }
+  await client.send('Runtime.evaluate', {
+    expression: `fetch('/login', { method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify({token:'${TOKEN}'}) }).then(r=>r.text())`,
+    returnByValue: true, awaitPromise: true,
+  });
+  await client.send('Page.navigate', { url: `${BASE}/` });
+}
+
+/** eval 便捷封装 */
+export async function ev(client, expression) {
+  const { result } = await client.send('Runtime.evaluate', { expression, returnByValue: true });
+  return result?.value;
+}
+
+/** 真实鼠标点击 */
+export async function click(client, x, y) {
+  await client.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x, y });
+  await sleep(120);
+  await client.send('Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button: 'left', clickCount: 1 });
+  await sleep(80);
+  await client.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button: 'left', clickCount: 1 });
+}

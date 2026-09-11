@@ -61,13 +61,31 @@ class V4FrameHub {
     this.telemetryEmitters = new Map();
     this.cuaEmitter = new Emitter();
     this.subBindings = new Map();   // subscriptionId -> workspaceKey (订阅时渲染器声明的真实 workspace)
+    this.pendingFrames = new Map(); // subscriptionId -> [frame,...] (bind 前先到的帧, bind 时重放)
+  }
+  /** bind 前到达的帧暂存 —— app-server 的 snapshot 帧可能与 subscribe ack 竞态先到 */
+  _bufferFrame(subscriptionId, params) {
+    let buf = this.pendingFrames.get(subscriptionId);
+    if (!buf) { buf = []; this.pendingFrames.set(subscriptionId, buf); }
+    if (buf.length < 200) buf.push(params);
   }
   /** subscribe ack 后登记: wire 帧的 workspace 字段是 app-server 进程级默认工作区,
    *  并非渲染器订阅时声明的 workspace —— 单进程多逻辑工作区部署必须按 subscriptionId 路由。*/
   bindSubscription(subscriptionId, wsKey) {
-    if (typeof subscriptionId === 'string' && subscriptionId) this.subBindings.set(subscriptionId, wsKey);
+    if (typeof subscriptionId === 'string' && subscriptionId) {
+      this.subBindings.set(subscriptionId, wsKey);
+      const buf = this.pendingFrames.get(subscriptionId);
+      if (buf?.length) {
+        this.pendingFrames.delete(subscriptionId);
+        for (const f of buf) {
+          if (typeof f?.topic === 'string' && f.topic.startsWith('sessions-index/')) this.index(wsKey).fire(f);
+          else if (typeof f?.topic === 'string' && f.topic.startsWith('workspace-config/')) this.config(wsKey).fire(f);
+          else this.conv(wsKey).fire(f);
+        }
+      }
+    }
   }
-  unbindSubscription(subscriptionId) { this.subBindings.delete(subscriptionId); }
+  unbindSubscription(subscriptionId) { this.subBindings.delete(subscriptionId); this.pendingFrames.delete(subscriptionId); }
   _get(map, key) {
     let em = map.get(key);
     if (!em) { em = new Emitter(); map.set(key, em); }
@@ -84,12 +102,19 @@ class V4FrameHub {
     try {
       if (method === 'v4/conversation/frame') {
         const topic = params?.topic;
-        let wsKey = this.subBindings.get(params?.subscriptionId)
-          ?? this.subBindings.get(params?.frame?.subscriptionId)
-          ?? (workspaceKey(params?.workspace ?? {}) || this.defaultWorkspacePath);
-        // sessions-index/<workspacePath> / workspace-config/<workspacePath>: 路径编码在 topic 里
-        if (typeof topic === 'string' && topic.startsWith('sessions-index/')) return this.index(this.subBindings.get(params?.subscriptionId) ?? this.defaultWorkspacePath).fire(params);
-        if (typeof topic === 'string' && topic.startsWith('workspace-config/')) return this.config(this.subBindings.get(params?.subscriptionId) ?? this.defaultWorkspacePath).fire(params);
+        const subId = params?.subscriptionId ?? params?.frame?.subscriptionId;
+        const boundKey = typeof subId === 'string' ? this.subBindings.get(subId) : undefined;
+        if (boundKey) {
+          if (typeof topic === 'string' && topic.startsWith('sessions-index/')) return this.index(boundKey).fire(params);
+          if (typeof topic === 'string' && topic.startsWith('workspace-config/')) return this.config(boundKey).fire(params);
+          return this.conv(boundKey).fire(params);
+        }
+        // 未绑定的 sub: 若帧声明了 subscriptionId → 暂存等待 bind (subscribe ack 竞态);
+        // 否则 (如 sessions-index 初始推送) 回退帧内 workspace / 默认 key。
+        if (typeof subId === 'string' && subId) return this._bufferFrame(subId, params);
+        const wsKey = workspaceKey(params?.workspace ?? {}) || this.defaultWorkspacePath;
+        if (typeof topic === 'string' && topic.startsWith('sessions-index/')) return this.index(this.defaultWorkspacePath).fire(params);
+        if (typeof topic === 'string' && topic.startsWith('workspace-config/')) return this.config(this.defaultWorkspacePath).fire(params);
         return this.conv(wsKey).fire(params);
       }
       if (method === 'v4/telemetry/event') {
@@ -295,7 +320,7 @@ function buildV4Methods({ appServer, frameHub, logger, configPath, workspacePath
     async subscribeSessionsIndexV4(m) {
       const c = connectionFor(m);
       const key = workspaceKey(m) || workspacePath;
-      return A('v4/conversation/subscribe', {
+      const r = await A('v4/conversation/subscribe', {
         topic: `sessions-index/${key}`,
         connectionId: c.connectionId,
         clientMode: 'desktop-continuous',
@@ -303,10 +328,14 @@ function buildV4Methods({ appServer, frameHub, logger, configPath, workspacePath
         ...(m?.base !== undefined ? { base: m.base } : {}),
         ...(m?.visibility !== undefined ? { visibility: m.visibility } : {}),
       });
+      const ackSub = r?.ack?.subscriptionId ?? r?.subscriptionId;
+      if (ackSub) frameHub.bindSubscription(ackSub, key);
+      return r;
     },
     async unsubscribeSessionsIndexV4(m) {
       const c = connectionFor(m);
       const key = workspaceKey(m) || workspacePath;
+      if (m?.subscriptionId) frameHub.unbindSubscription(m.subscriptionId);
       try {
         return await A('v4/conversation/unsubscribe', {
           topic: `sessions-index/${key}`,
