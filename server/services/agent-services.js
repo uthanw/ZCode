@@ -311,6 +311,8 @@ function buildZCodeTaskService({ appServer, defaultWorkspace, logger, services, 
     // useTaskSessionFilePath / useTaskNativeSessionLogFile: {path, exists} —— 无本地快照文件，返回不存在即可
     async getTaskSessionFilePath() { return { path: null, exists: false }; },
     async getTaskNativeSessionLogFile() { return { path: null, exists: false }; },
+    // 原版读本地 model-io jsonl 轨迹文件; web 版暂无本地轨迹产物 → 空轨迹是合法形状
+    async getModelTrajectory() { return { records: [], sourceFiles: [], truncated: false }; },
     // 注意：事件方法不能是 async —— fromService 的动态事件路径会把返回值当订阅函数调用，
     // async 函数返回 Promise，曾导致 "channel.listen(...) is not a function"。
     onDynamicWorkspaceEvent(arg) {
@@ -345,6 +347,26 @@ function buildZCodeAgentService({ appServer, defaultWorkspace, logger, configPat
   });
   return {
     ...v4,
+    // 原版 host syncAppRuntimePreferences: 存内存 + 推给 app-server 两个偏好接口。
+    // web 版单进程 → 直接转发即可（失败不致命，只 warn）。
+    async syncAppRuntimePreferences(p) {
+      const ws = normWs(p);
+      const jobs = [];
+      if (p?.askUserQuestionAutoResolutionEnabled !== undefined) {
+        jobs.push(appServer.request('workspace/updateInteractionPreferences', {
+          workspace: ws,
+          preferences: { askUserQuestionAutoResolutionEnabled: p.askUserQuestionAutoResolutionEnabled === true },
+        }, { timeoutMs: 30000 }).catch((e) => logger.warn?.('updateInteractionPreferences failed:', e.message)));
+      }
+      if (p?.modelIoFullRetentionEnabled !== undefined) {
+        jobs.push(appServer.request('workspace/updateModelIoPreferences', {
+          workspace: ws,
+          preferences: { modelIoFullRetentionEnabled: p.modelIoFullRetentionEnabled === true },
+        }, { timeoutMs: 30000 }).catch((e) => logger.warn?.('updateModelIoPreferences failed:', e.message)));
+      }
+      await Promise.all(jobs);
+      return { ok: true };
+    },
     async sendPrompt(p) {
       const params = {
         sessionId: p.sessionId,

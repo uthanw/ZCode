@@ -930,7 +930,12 @@ function buildAllChannels({ appServer, workspaceRoot, logger, configPath }) {
     [CHANNELS.Broadcast]: broadcastService(),
     [CHANNELS.OAuth]: oauthService(),
     [CHANNELS.ModelProvider]: modelProviderService({ appServer, defaultWorkspace, configPath, logger }),
-    [CHANNELS.UsageStats]: { async getEntitlementSnapshot() { return { entitled: false }; }, async getUsage() { return { usage: {} }; } },
+    [CHANNELS.UsageStats]: {
+      async getEntitlementSnapshot() { return { entitled: false }; },
+      async getUsage() { return { usage: {} }; },
+      // 原版聚合本地/远端 usage 快照; web 版无订阅数据 → 空快照
+      async getAppUsageSnapshot() { return { snapshots: [], entitlement: null }; },
+    },
     [CHANNELS.CodingPlanSubscription]: {
       async getEnterprisePricing() { return null; },
       async getStatus() { return { active: false }; },
@@ -947,7 +952,12 @@ function buildAllChannels({ appServer, workspaceRoot, logger, configPath }) {
     [CHANNELS.ClientScenes]: { async getActiveScene() { return { scene: 'default' }; }, async list() { return { code: 0, msg: '', data: [] }; } },
     [CHANNELS.Skills]: { async list() { return { skills: [] }; }, async get() { return null; } },
     [CHANNELS.SkillSync]: { async sync() { return { ok: true }; } },
-    [CHANNELS.McpSync]: { async sync() { return { ok: true }; }, async list() { return { servers: [] }; } },
+    [CHANNELS.McpSync]: {
+      async sync() { return { ok: true }; },
+      async list() { return { servers: [] }; },
+      // 渲染器 mergeServerStatusSnapshots(e.statuses,...) —— statuses 必须是数组
+      async listWorkspaceMcpServerStatuses() { return { statuses: [] }; },
+    },
     [CHANNELS.PluginSync]: { async sync() { return { ok: true }; } },
     [CHANNELS.Plugins]: { async list() { return { plugins: [] }; } },
     [CHANNELS.PluginManagement]: {
@@ -991,6 +1001,8 @@ function buildAllChannels({ appServer, workspaceRoot, logger, configPath }) {
       async readPages() { return { pages: [] }; },
       async listPages() { return { pages: [] }; },
       async search() { return { results: [] }; },
+      // 原版读本地 wiki/draft/task 摘要文件; web 版无本地 wiki 产物 → 各字段 null
+      async readSummary() { return { wiki: null, draft: null, task: null }; },
     },
     [CHANNELS.PromptAttachmentTransfer]: { async begin() { return { ok: false }; }, async chunk() { return { ok: false }; }, async commit() { return { ok: false }; } },
     [CHANNELS.OffPeakTask]: { async list() { return { tasks: [] }; } },
