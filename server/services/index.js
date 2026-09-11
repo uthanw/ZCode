@@ -335,6 +335,43 @@ function gitService({ logger, workspaceRoot }) {
       resolve({ ok: !err, stdout: stdout || '', stderr: stderr || '' });
     });
   });
+  const cwdOf = (p) => (typeof p === 'string' && p ? p : workspaceRoot);
+  const gitErr = (e, args) => new Error(`git ${args[0]} 失败: ${(e.stderr || e.stdout || '').trim().slice(0, 400)}`);
+  // 相对工作区根的路径 (渲染器 workspaceRelativePath / repoRelativePath)
+  const relOf = (ws, abs) => {
+    if (!abs) return '';
+    let p = String(abs).replace(/\\/g, '/');
+    const w = String(ws).replace(/\/+$/, '');
+    if (w && p.startsWith(w + '/')) p = p.slice(w.length + 1);
+    return p;
+  };
+  const kindOf = (added, removed) => (added > 0 && removed === 0 ? 'added' : removed > 0 && added === 0 ? 'deleted' : 'modified');
+  // numstat 行 → {path, added, removed}; 重命名 (a => b) 取 b
+  const parseNumstat = (out) => {
+    const arr = [];
+    for (const line of out.split('\n')) {
+      if (!line.trim()) continue;
+      const m = line.match(/^(\d+|\t|\-)(\t|\s+)(\d+|\-)[\t\s]+(.+)$/);
+      if (!m) continue;
+      let p = m[4].trim();
+      const ren = p.match(/^(.+) => (.+)$/);
+      if (ren) p = ren[2].replace(/^"|"$/g, '');
+      arr.push({ path: p, added: m[1] === '-' ? 0 : parseInt(m[1], 10) || 0, removed: m[3] === '-' ? 0 : parseInt(m[3], 10) || 0 });
+    }
+    return arr;
+  };
+  // 单文件 diff 文本 (patch)。
+  // 注意: porcelain/numstat 输出相对 repo 根, 而 workspacePath 可能是 repo 子目录 —
+  // pathspec 相对 cwd 解析, 故统一用 repoRoot 作为 cwd。
+  const repoRootOf = async (ws) => {
+    const r = await run(['rev-parse', '--show-toplevel'], ws);
+    return r.ok ? r.stdout.trim() : ws;
+  };
+  const diffText = async (root, sourceId, filePath) => {
+    if (sourceId === 'staged') return run(['diff', '--cached', '--', filePath], root);
+    if (sourceId === 'branch') return run(['diff', '@{u}...', '--', filePath], root);
+    return run(['diff', '--', filePath], root);
+  };
   return {
     async getChanges({ workspacePath }) {
       const st = await run(['status', '--porcelain=v1', '-z'], workspacePath);
@@ -351,7 +388,233 @@ function gitService({ logger, workspaceRoot }) {
       const e = await run(['config', 'user.email'], workspacePath);
       return { name: n.stdout.trim() || '', email: e.stdout.trim() || '' };
     },
-    async refresh({ workspacePath }) { return { ok: true }; },
+    // ---- GitPane 数据源 (useGitRepository.refresh) ----
+    // 形状逆向自渲染器: {summary, identity, unstagedChanges, stagedChanges, branchComparison}
+    async refresh({ workspacePath, includeIdentity, includeBranchComparison } = {}) {
+      const ws = cwdOf(workspacePath);
+      const emptySummary = (w) => ({
+        workspacePath: w, repoRoot: w, workspaceInRepoPath: '.', autoRefreshWatchPaths: [],
+        branchName: null, trackingBranchName: null, headRefType: 'branch', ahead: 0, behind: 0,
+        isDirty: false, isGitAvailable: false, isRepository: false,
+      });
+      const repoRoot = await run(['rev-parse', '--show-toplevel'], ws);
+      if (!repoRoot.ok) return {
+        summary: emptySummary(ws),
+        identity: null, unstagedChanges: [], stagedChanges: [], branchComparison: null,
+      };
+      const [porcelain, branch, tracking, inRepo] = await Promise.all([
+        run(['status', '--porcelain=v1', '-z', '-b'], ws),
+        run(['rev-parse', '--abbrev-ref', 'HEAD'], ws),
+        run(['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{u}'], ws),
+        run(['rev-parse', '--show-prefix'], ws),
+      ]);
+      const branchName = branch.stdout.trim() || null;
+      const trackingBranchName = tracking.ok ? tracking.stdout.trim() || null : null;
+      let ahead = 0, behind = 0;
+      if (trackingBranchName) {
+        const ab = await run(['rev-list', '--left-right', '--count', `${trackingBranchName}...HEAD`], ws);
+        if (ab.ok) {
+          const mm = ab.stdout.trim().match(/^(\d+)\s+(\d+)$/);
+          if (mm) { behind = parseInt(mm[1], 10) || 0; ahead = parseInt(mm[2], 10) || 0; }
+        }
+      }
+      // porcelain 分行 (含 -b 头行)
+      const lines = porcelain.ok ? porcelain.stdout.split('\0').filter((l, idx) => idx === 0 || l) : [];
+      const bodyLines = lines.slice(1);
+      const isDirty = bodyLines.some((l) => l && !/^\?\? /.test(l));
+      const summary = {
+        workspacePath: ws, repoRoot: repoRoot.stdout.trim(), workspaceInRepoPath: inRepo.stdout.trim() || '.',
+        autoRefreshWatchPaths: [], branchName, trackingBranchName, headRefType: 'branch',
+        ahead, behind, isDirty, isGitAvailable: true, isRepository: true,
+      };
+      // 变更列表 + 行数统计 (numstat: staged 用 --cached, unstaged 两者差集)
+      const [stagedStat, unstagedStat] = await Promise.all([
+        run(['diff', '--cached', '--numstat'], ws),
+        run(['diff', '--numstat'], ws),
+      ]);
+      const stagedNum = parseNumstat(stagedStat.stdout);
+      const unstagedNum = parseNumstat(unstagedStat.stdout);
+      const numBy = (arr) => new Map(arr.map((e) => [e.path, e]));
+      const stagedMap = numBy(stagedNum);
+      const unstagedMap = numBy(unstagedNum);
+      const mkChange = (p, section, isStaged, isUntracked, isConflicted, added, removed) => {
+        const rel = relOf(ws, p);
+        return {
+          path: p, stagePath: p, repoRelativePath: rel, workspaceRelativePath: rel,
+          kind: kindOf(added, removed), section, added, removed,
+          isStaged, isUntracked, isConflicted,
+          diff: { path: p, availability: 'unavailable', patch: null, beforeContent: null, afterContent: null, summary: null },
+        };
+      };
+      const unstagedChanges = [], stagedChanges = [];
+      for (const l of bodyLines) {
+        if (!l || l.length < 4) continue;
+        const xy = l.slice(0, 2);
+        const p = l.slice(3);
+        const u = unstagedMap.get(p);
+        const st = stagedMap.get(p);
+        const isUntracked = xy === '??';
+        const isConflicted = /([ADU]{2})/.test(xy) && xy[0] !== xy[1] && xy !== '??';
+        if (isUntracked) {
+          unstagedChanges.push(mkChange(p, 'untracked', false, true, false, 0, 0));
+        } else {
+          // staged 部分 (X 非 ' ')
+          if (xy[0] !== ' ') stagedChanges.push(mkChange(p, 'staged', true, false, false, st?.added ?? 0, st?.removed ?? 0));
+          // unstaged 部分 (Y 非 ' ')
+          if (xy[1] !== ' ') unstagedChanges.push(mkChange(p, 'unstaged', false, false, isConflicted, u?.added ?? 0, u?.removed ?? 0));
+        }
+      }
+      // identity
+      let identity = null;
+      if (includeIdentity) {
+        const [un, ue, unSrc, ueSrc] = await Promise.all([
+          run(['config', 'user.name'], ws), run(['config', 'user.email'], ws),
+          run(['config', '--show-origin', 'user.name'], ws), run(['config', '--show-origin', 'user.email'], ws),
+        ]);
+        const srcOf = (t) => { const m = String(t).match(/file:(\S+)/); return m ? m[1] : null; };
+        identity = {
+          userName: un.stdout.trim() || null, userEmail: ue.stdout.trim() || null,
+          nameSource: srcOf(unSrc.stdout), emailSource: srcOf(ueSrc.stdout), scopeLabel: null,
+        };
+      }
+      // branchComparison (与上游差异)
+      let branchComparison = null;
+      if (includeBranchComparison && trackingBranchName) {
+        const cmpStat = await run(['diff', '--numstat', `${trackingBranchName}...HEAD`], ws);
+        branchComparison = {
+          baseRef: trackingBranchName, headRef: branchName, comparisonLabel: `${trackingBranchName}...${branchName}`,
+          changes: parseNumstat(cmpStat.stdout).map((e) => {
+            const rel = relOf(ws, e.path);
+            return {
+              path: e.path, stagePath: e.path, repoRelativePath: rel, workspaceRelativePath: rel,
+              kind: kindOf(e.added, e.removed), section: 'branch', added: e.added, removed: e.removed,
+              isStaged: false, isUntracked: false, isConflicted: false,
+              diff: { path: e.path, availability: 'unavailable', patch: null, beforeContent: null, afterContent: null, summary: null },
+            };
+          }),
+        };
+      }
+      return { summary, identity, unstagedChanges, stagedChanges, branchComparison };
+    },
+    // 文件展开 diff: {availability, patch, beforeContent, afterContent}
+    async getDiff({ workspacePath, path: filePath, sourceId } = {}) {
+      const ws = cwdOf(workspacePath);
+      if (!filePath) return { availability: 'unavailable', patch: null, beforeContent: null, afterContent: null, summary: null };
+      const root = await repoRootOf(ws);
+      const d = await diffText(root, sourceId, filePath);
+      if (!d.ok || !d.stdout.trim()) {
+        // untracked 文件: 展示全文内容
+        if (sourceId !== 'staged') {
+          try {
+            const content = await require('fs').promises.readFile(require('path').join(root, filePath), 'utf8');
+            return { availability: 'patch', patch: null, beforeContent: null, afterContent: content, summary: null };
+          } catch { /* fallthrough */ }
+        }
+        return { availability: 'unavailable', patch: null, beforeContent: null, afterContent: null, summary: null };
+      }
+      return { availability: 'patch', patch: d.stdout, beforeContent: null, afterContent: null, summary: null };
+    },
+    // ---- Git 操作 (actionMenu / branchSwitcher) ----
+    async stagePaths({ workspacePath, paths } = {}) {
+      const ws = cwdOf(workspacePath);
+      const root = await repoRootOf(ws);
+      const list = (Array.isArray(paths) ? paths : []).filter((p) => typeof p === 'string' && p);
+      if (!list.length) return { ok: true, staged: [] };
+      const r = await run(['add', '--', ...list], root);
+      if (!r.ok) throw gitErr(r, ['add']);
+      return { ok: true, staged: list };
+    },
+    async commit({ workspacePath, message, paths, stagedOnly } = {}) {
+      const ws = cwdOf(workspacePath);
+      const msg = typeof message === 'string' && message.trim() ? message : null;
+      if (!msg) throw new Error('commit 需要非空提交信息');
+      if (Array.isArray(paths) && paths.length && stagedOnly === false) {
+        // 按路径提交 (未暂存改动也包含): 先 stage 再 commit
+        const root2 = await repoRootOf(ws);
+        const add = await run(['add', '--', ...paths.filter((p) => typeof p === 'string' && p)], root2);
+        if (!add.ok) throw gitErr(add, ['add']);
+      }
+      const c = await run(['commit', '-m', msg], ws);
+      if (!c.ok) {
+        const e = new Error((c.stderr || c.stdout || '').trim().slice(0, 400));
+        e.detail = (c.stderr || '').split('\n')[0];
+        throw e;
+      }
+      const h = await run(['rev-parse', 'HEAD'], ws);
+      return { ok: true, hash: h.stdout.trim(), message: msg };
+    },
+    async push({ workspacePath } = {}) {
+      const ws = cwdOf(workspacePath);
+      const branch = await run(['rev-parse', '--abbrev-ref', 'HEAD'], ws);
+      if (!branch.ok) throw new Error('非 Git 仓库');
+      const p = await run(['push'], ws);
+      if (!p.ok) {
+        const e = new Error((p.stderr || p.stdout || '').trim().slice(0, 400));
+        e.detail = (p.stderr || '').split('\n')[0];
+        throw e;
+      }
+      return { ok: true, branchName: branch.stdout.trim(), message: '推送成功' };
+    },
+    async getLocalBranches({ workspacePath } = {}) {
+      const ws = cwdOf(workspacePath);
+      const cur = await run(['rev-parse', '--abbrev-ref', 'HEAD'], ws);
+      if (!cur.ok) return { branches: [], currentBranchName: null, headRefType: 'branch' };
+      const currentBranchName = cur.stdout.trim();
+      const list = await run(['for-each-ref', '--format=%(refname:short)', 'refs/heads/'], ws);
+      const branches = list.ok ? list.stdout.trim().split('\n').filter(Boolean)
+        .map((name) => ({ name, isCurrent: name === currentBranchName })) : [];
+      return { branches, currentBranchName, headRefType: 'branch' };
+    },
+    async switchBranch({ workspacePath, targetBranchName } = {}) {
+      const ws = cwdOf(workspacePath);
+      const name = typeof targetBranchName === 'string' ? targetBranchName.trim() : '';
+      if (!name) throw new Error('switchBranch 需要目标分支名');
+      const c = await run(['checkout', name], ws);
+      if (!c.ok) throw new Error((c.stderr || c.stdout || '').trim().slice(0, 400));
+      const cur = await run(['rev-parse', '--abbrev-ref', 'HEAD'], ws);
+      const bn = cur.stdout.trim();
+      return {
+        ok: true, action: 'switch', branchName: bn, didChange: true, created: false,
+        summary: { branchName: bn, headRefType: 'branch' },
+        issues: [], detail: null, message: `已切换到 ${bn}`,
+      };
+    },
+    async createBranchAndSwitch({ workspacePath, branchName } = {}) {
+      const ws = cwdOf(workspacePath);
+      const name = typeof branchName === 'string' ? branchName.trim() : '';
+      if (!name) throw new Error('createBranchAndSwitch 需要分支名');
+      const c = await run(['checkout', '-b', name], ws);
+      if (!c.ok) throw new Error((c.stderr || c.stdout || '').trim().slice(0, 400));
+      return {
+        ok: true, action: 'create', branchName: name, didChange: true, created: true,
+        summary: { branchName: name, headRefType: 'branch' },
+        issues: [], detail: null, message: `已创建并切换到 ${name}`,
+      };
+    },
+    async getCommitGraph({ workspacePath, maxCount, skip } = {}) {
+      const ws = cwdOf(workspacePath);
+      const limit = Math.max(1, Math.min(500, parseInt(maxCount, 10) || 50));
+      const offset = Math.max(0, parseInt(skip, 10) || 0);
+      const out = await run([
+        'log', `--max-count=${limit + 1}`, `--skip=${offset}`,
+        '--format=%H%x09%an%x09%at%x09%s%x09%P%x09%D',
+      ], ws);
+      if (!out.ok) return { commits: [], hasMore: false };
+      const rows = out.stdout.trim().split('\n').filter(Boolean);
+      const hasMore = rows.length > limit;
+      const commits = rows.slice(0, limit).map((line) => {
+        const [hash, authorName, at, subject, parents, refsRaw] = line.split('\t');
+        const refs = (refsRaw || '').split(',').map((r) => r.trim()).filter(Boolean).map((r) => {
+          const isHead = r === 'HEAD' || r.startsWith('HEAD ->');
+          return { kind: isHead ? 'head' : r.startsWith('tag:') ? 'tag' : 'head', name: r.replace(/^HEAD ->\s*/, '') };
+        });
+        return {
+          hash, authorName, subject: subject || '', authoredAtMs: (parseInt(at, 10) || 0) * 1000,
+          parents: (parents || '').split(' ').filter(Boolean), refs,
+        };
+      });
+      return { commits, hasMore };
+    },
     // .gitignore / .zcodeignore 规则查询（源控制树过滤未跟踪噪声）
     async getIgnoredPaths({ workspacePath, paths } = {}) {
       const list = Array.isArray(paths) ? paths : [];
