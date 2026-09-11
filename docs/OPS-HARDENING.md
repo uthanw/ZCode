@@ -139,11 +139,15 @@ WebSocket；服务端同理必须保住同一个 ChannelServer，否则事件订
   24MB/8000 帧）/ 宽限期超时 / 订阅全丢（`subscriptions-lost`）/ 服务重启
   （`session-not-found`）→ 客户端明确收到 `resumed:false` 后整页重载。
   宁可重载，也不要一个看起来正常、实际半死的界面。
-- **连接指示器**：Next.js devtools 徽标风格。内容区左下角（侧边栏 264px 之外）常驻
-  圆形徽标，正常时缩为半透明小点，状态变化时弹性放大高亮（busy 态带脉冲）；
-  点击展开浮动状态卡（状态文案/倒计时/延迟/订阅数/操作按钮），点外部或 Esc 收回。
-  Shadow DOM 隔离 + 应用 CSS 变量（`--color-card/--color-foreground/--radius-lg` 等），
-  明暗主题自动跟随。前端调试出口：`window.__zcodeNet`（stats/reconnect/health/drop）。
+- **连接指示器**：Next.js devtools 徽标风格。视口右上角（标题栏 h-12 之下、避开
+  窗口控制按钮）常驻圆形徽标，正常时缩为半透明小点，状态变化时弹性放大高亮
+  （busy 态带脉冲）；点击展开浮动状态卡（状态文案/倒计时/延迟/订阅数/操作按钮），
+  点外部或 Esc 收回。徽标**可拖动**：pointer 事件 + 5px 位移阈值区分点按/拖动，
+  位置存 `localStorage['zcode-indicator-pos']` 跨会话记忆，越界自动钳制；
+  面板右缘对齐徽标，贴近视口底部/左侧时自动翻转。Shadow DOM 隔离 + 应用 CSS
+  变量（`--color-card/--color-foreground/--radius-lg` 等），明暗主题自动跟随。
+  前端调试出口：`window.__zcodeNet`（stats/reconnect/health/drop/indicator.pos/
+  indicator.resetPos）。
 
 ### 控制帧协议（WS 文本帧；二进制帧一律是 RPC 负载）
 

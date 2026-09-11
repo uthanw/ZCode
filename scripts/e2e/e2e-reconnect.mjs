@@ -38,7 +38,12 @@ await client.send('Page.addScriptToEvaluateOnNewDocument', { source: `
   window.addEventListener('zcode-net-state', (e) => window.__netLog.push(e.detail.state));
 ` });
 
-const ev = (expr, awaitPromise=false) => client.send('Runtime.evaluate', { expression: expr, returnByValue: true, awaitPromise }).then(r=>r.result?.value);
+// 页面整页重载时 CDP evaluate 可能永远不返回（execution context 销毁），
+// 统一 12s 超时兜底，让等待循环能继续轮询而不是悬死。
+const ev = (expr, awaitPromise=false) => Promise.race([
+  client.send('Runtime.evaluate', { expression: expr, returnByValue: true, awaitPromise }).then(r=>r.result?.value),
+  new Promise((res) => setTimeout(() => res(undefined), 12000)),
+]);
 async function shot(name) {
   if (!SHOT) return;
   const { data } = await client.send('Page.captureScreenshot', { format: 'png' });
@@ -138,7 +143,9 @@ check('状态变化时徽标高亮出现', (await netView())?.attn === '1');
 const v6 = await netView();
 const box = v6?.badgeRect;
 const vh = await innerHeightOfPage();
-check('徽标位于内容区左下角、不遮挡侧边栏', box && box.x > 264 && box.x < 340 && box.bottom > vh - 60, JSON.stringify(box) + ' vh=' + vh);
+const vw6 = await ev('innerWidth');
+// 默认右上角: 标题栏(h-12≈48px)之下, 距右边缘 ~14px
+check('徽标默认位于右上角（标题栏之下、避开窗口控制）', box && box.y > 48 && box.y < 90 && box.right > vw6 - 60, JSON.stringify(box) + ` vw=${vw6}`);
 await shot('badge');
 await ev(`document.getElementById('zcode-net-indicator').shadowRoot.querySelector('.badge').click()`);
 // 面板展开有 180ms opacity + 380ms transform 过渡, 轮询到稳定
@@ -153,6 +160,42 @@ await shot('panel-open');
 await ev(`document.getElementById('zcode-net-indicator').shadowRoot.querySelector('.badge').click()`);
 await sleep(400);
 check('再次点击收回面板', (await netView())?.open === '0');
+// ---- 拖动: CDP 真实鼠标事件, 从徽标中心拖到左下方向 ----
+const posBefore = await ev(`window.__zcodeNet.indicator.pos`);
+const bc = box; // badge rect (34px)
+const fromX = Math.round(bc.x + 17), fromY = Math.round(bc.y + 17);
+const toX = Math.round(fromX - 600), toY = Math.round(fromY + 300);
+await client.send('Input.dispatchMouseEvent', { type: 'mousePressed', x: fromX, y: fromY, button: 'left', clickCount: 1 });
+for (let i = 1; i <= 10; i++) {
+  await client.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: Math.round(fromX + (toX - fromX) * i / 10), y: Math.round(fromY + (toY - fromY) * i / 10), button: 'left', buttons: 1 });
+}
+await sleep(100);
+await client.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: toX, y: toY, button: 'left', clickCount: 1 });
+await sleep(300);
+const posAfter = await ev(`window.__zcodeNet.indicator.pos`);
+const moved = posBefore && posAfter && (Math.abs(posAfter.x - posBefore.x) > 300) && (Math.abs(posAfter.y - posBefore.y) > 100);
+
+check('徽标可拖动到新位置', !!moved, `before=${JSON.stringify(posBefore)} after=${JSON.stringify(posAfter)}`);
+check('拖动不误触发面板开合', (await netView())?.open === '0');
+await shot('dragged');
+// localStorage 持久化
+const saved = await ev(`JSON.parse(localStorage.getItem('zcode-indicator-pos') || 'null')`);
+check('拖动后位置写入 localStorage', !!saved && Math.abs(saved.x - posAfter.x) < 2 && Math.abs(saved.y - posAfter.y) < 2, JSON.stringify(saved));
+// 拖到新位置后面板仍能正常展开
+await ev(`document.getElementById('zcode-net-indicator').shadowRoot.querySelector('.badge').click()`);
+let opened2 = null;
+for (let i=0;i<12;i++) {
+  await sleep(150);
+  opened2 = await netView();
+  if (opened2?.open === '1' && opened2?.panelOpacity === '1') break;
+}
+const pr = opened2?.panelRect;
+check('拖动后面板跟随新位置展开', opened2?.open === '1' && pr && Math.abs((pr.y) - (posAfter.y + 44)) < 80, JSON.stringify(pr));
+await ev(`document.getElementById('zcode-net-indicator').shadowRoot.querySelector('.badge').click()`);
+await ev(`window.__zcodeNet.indicator.resetPos()`);
+await sleep(300);
+const restored = await ev(`window.__zcodeNet.indicator.pos`);
+check('resetPos 恢复默认右上角', restored && restored.x > vw6 - 60 && restored.y < 90, JSON.stringify(restored));
 // 主题一致性：取自应用 CSS 变量
 const themed = await ev(`(()=>{ const h=document.getElementById('zcode-net-indicator'); const p=h.shadowRoot.querySelector('.panel'); const cs=getComputedStyle(p); const app=getComputedStyle(document.documentElement); return { bg: cs.backgroundColor, color: cs.color, radius: cs.borderRadius, blur: cs.backdropFilter, appCard: app.getPropertyValue('--color-card').trim(), appFg: app.getPropertyValue('--color-foreground').trim() }; })()`);
 check('样式继承应用主题变量', themed && themed.color && themed.bg && themed.bg !== 'rgba(0, 0, 0, 0)', JSON.stringify(themed));

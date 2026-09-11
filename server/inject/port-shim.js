@@ -155,14 +155,16 @@
   // ==========================================================================
   // 连接状态指示器（Next.js devtools 徽标风格）
   // --------------------------------------------------------------------------
-  // 形态参考 Next.js 的浮动 debugger 徽标：内容区左下角一枚圆形徽标，
+  // 形态参考 Next.js 的浮动 debugger 徽标：视口右上角一枚圆形徽标，
   // 平时缩成半透明小点安静待命，状态变化时以弹性动画放大出现；
-  // 点击展开一张从徽标上方弹出的浮动状态卡（含副标题/倒计时/操作按钮），
+  // 点击展开一张从徽标下方弹出的浮动状态卡（含副标题/倒计时/操作按钮），
   // 点外部或再次点击徽标收回。整个组件在 Shadow DOM 里：自定义属性
   // （--color-card 等）能穿透 shadow 边界继承，自动跟随 ZCode 明/暗主题；
   // 而应用的 Tailwind preflight 不会反过来污染它。
   //
-  // 位置：主内容区左下角（侧边栏 264px 之外），不与任何宿主元素抢位；
+  // 位置：默认右上角（标题栏 h-12 之下、避开窗口控制按钮），**可拖动**——
+  // pointer 事件 + 位移阈值区分「点按开合面板」与「拖动改位」，位置存
+  // localStorage 跨会话记忆；面板自动跟随徽标，贴边时上下/左右翻转。
   // 徽标常驻（连接正常时低调半透明），用户随时可点开查看连接详情。
   // ==========================================================================
   const Indicator = (function () {
@@ -171,27 +173,31 @@
       degraded: '#ff9f45', offline: '#ff5c5c',
       connected: '#2ecc8f', failed: '#ff5c5c', reloading: '#ff5c5c',
     };
+    const POS_KEY = 'zcode-indicator-pos';
+    const BADGE_SIZE = 34;
     let host = null, sr = null, wrap = null, badge = null, face = null,
       panel = null, pTitle = null, pSub = null, pAct = null, pStats = null;
     let open = false, spotlightTimer = null, showTimer = null;
     let cur = { state: 'idle', text: '', sub: '', action: null };
     let pendingRender = null;   // body 就绪前只保留最后一次状态，避免补播过期动画
+    let pos = null;             // 徽标坐标 {x,y}（wrap 的 --bx/--by）
 
     const CSS = `
 :host { all: initial; }
 * { box-sizing: border-box; }
 .wrap {
-  position: fixed; left: 0; bottom: 0; right: 0;
+  position: fixed; left: 0; top: 0; right: 0; bottom: 0;
   pointer-events: none;
   font-family: var(--font-sans, ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", sans-serif);
   font-feature-settings: "tnum" 1;
 }
-/* ---- 徽标：常驻圆点，状态变化时弹性放大 ---- */
+/* ---- 徽标：常驻圆点，状态变化时弹性放大；--bx/--by 由拖动逻辑维护 ---- */
 .badge {
   pointer-events: auto;
-  position: absolute; left: 280px; bottom: 14px;
+  position: absolute; left: var(--bx); top: var(--by); right: auto; bottom: auto;
   width: 34px; height: 34px; border-radius: 999px;
   display: grid; place-items: center; cursor: pointer;
+  touch-action: none;
   color: var(--color-foreground, #e7e7e7);
   background: color-mix(in oklab, var(--color-card, #2b2b2b) 92%, transparent);
   border: 1px solid var(--color-border, rgba(255,255,255,.12));
@@ -206,6 +212,7 @@
 }
 .badge:hover { opacity: 1; }
 .wrap[data-attn="1"] .badge, .wrap[data-open="1"] .badge { opacity: 1; transform: scale(1); }
+.wrap[data-dragging="1"] .badge { cursor: grabbing; opacity: 1; transform: scale(1); transition: opacity .15s ease; }
 .face { position: relative; width: 10px; height: 10px; border-radius: 999px;
   background: var(--tone, #f0a92a);
   box-shadow: 0 0 0 3px color-mix(in oklab, var(--tone, #f0a92a) 22%, transparent);
@@ -219,10 +226,11 @@
 }
 .wrap[data-busy="1"] .face::after { animation: zc-ping 1.7s cubic-bezier(0,0,.2,1) infinite; }
 @keyframes zc-ping { 0% { transform: scale(1); opacity: .55 } 70%, 100% { transform: scale(2.6); opacity: 0 } }
-/* ---- 浮动状态卡：从徽标上方弹出 ---- */
+/* ---- 浮动状态卡：从徽标下方弹出，右缘对齐徽标；贴底时翻转到上方 ---- */
 .panel {
   pointer-events: auto;
-  position: absolute; left: 280px; bottom: 56px;
+  position: absolute; top: calc(var(--by) + ${BADGE_SIZE + 10}px); left: auto;
+  right: calc(100% - var(--bx) - ${BADGE_SIZE}px);
   min-width: 250px; max-width: 380px;
   padding: 11px 13px;
   border-radius: var(--radius-lg, .5rem);
@@ -232,12 +240,16 @@
   box-shadow: 0 24px 48px -16px rgba(0,0,0,.6), 0 4px 12px -4px rgba(0,0,0,.35), inset 0 1px 0 color-mix(in oklab, var(--color-foreground, #fff) 6%, transparent);
   -webkit-backdrop-filter: blur(18px) saturate(180%);
   backdrop-filter: blur(18px) saturate(180%);
-  opacity: 0; transform: translateY(10px) scale(.92);
-  transform-origin: 20px calc(100% + 22px);
+  opacity: 0; transform: translateY(-8px) scale(.92);
+  transform-origin: calc(100% - 17px) -14px;
   transition: opacity .18s ease, transform .38s cubic-bezier(.22,1,.36,1);
   will-change: transform, opacity;
   visibility: hidden;
   -webkit-user-select: none; user-select: none;
+}
+.wrap[data-flip="1"] .panel {
+  top: auto; bottom: calc(100% - var(--by) + 10px);
+  transform-origin: calc(100% - 17px) calc(100% + 14px);
 }
 .wrap[data-open="1"] .panel {
   opacity: 1; transform: translateY(0) scale(1); visibility: visible;
@@ -296,15 +308,106 @@ button { appearance: none; border: 0; background: transparent; font: inherit; co
       pSub = wrap.querySelector('.p-sub');
       pAct = wrap.querySelector('.act');
       pStats = wrap.querySelector('.p-stats');
-      badge.addEventListener('click', (e) => { e.stopPropagation(); setOpen(!open); });
+      badge.addEventListener('click', (e) => {
+        e.stopPropagation();
+        if (suppressClick) { suppressClick = false; return; }   // 刚拖完，忽略尾随 click
+        setOpen(!open);
+      });
       pAct.addEventListener('click', () => { const a = cur.action; if (a && a.run) a.run(); });
       // 点面板外部 / Esc 收回
       document.addEventListener('click', (e) => { if (open && !host.contains(e.target)) setOpen(false); }, true);
       document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && open) setOpen(false); });
       document.body.appendChild(host);
+      initPos();
+      initDrag();
       const f = pendingRender; pendingRender = null;
       if (f) f();
       return true;
+    }
+
+    // ---------- 位置管理：默认右上角，localStorage 记忆，越界钳制 ----------
+    function clampPos(x, y) {
+      const vw = window.innerWidth || 1600, vh = window.innerHeight || 900;
+      return {
+        x: Math.max(8, Math.min(x, vw - BADGE_SIZE - 8)),
+        y: Math.max(8, Math.min(y, vh - BADGE_SIZE - 8)),
+      };
+    }
+    function applyPos() {
+      if (!wrap || !pos) return;
+      wrap.style.setProperty('--bx', pos.x + 'px');
+      wrap.style.setProperty('--by', pos.y + 'px');
+      // 徽标贴近视口底部时面板翻转到上方
+      const vh = window.innerHeight || 900;
+      const flip = pos.y + BADGE_SIZE + 190 > vh;
+      wrap.setAttribute('data-flip', flip ? '1' : '0');
+      // 面板右缘对齐徽标右缘；徽标被拖到最左侧时改为左缘对齐，避免面板溢出视口
+      const vw = window.innerWidth || 1600;
+      if (pos.x + BADGE_SIZE - 250 < 8) {
+        panel.style.right = 'auto';
+        panel.style.left = 'var(--bx)';
+      } else {
+        panel.style.left = 'auto';
+        panel.style.right = 'calc(100% - var(--bx) - ' + BADGE_SIZE + 'px)';
+      }
+      if (host) host.dataset.pos = pos.x + ',' + pos.y;   // 调试/E2E 观察
+    }
+    function initPos() {
+      try {
+        const saved = JSON.parse(localStorage.getItem(POS_KEY) || 'null');
+        if (saved && typeof saved.x === 'number' && typeof saved.y === 'number') {
+          pos = clampPos(saved.x, saved.y);
+        }
+      } catch {}
+      if (!pos) {
+        // 默认：右上角，标题栏(h-12)之下，避开宿主窗口控制按钮
+        const vw = window.innerWidth || 1600;
+        pos = clampPos(vw - BADGE_SIZE - 14, 54);
+      }
+      applyPos();
+      window.addEventListener('resize', () => { pos = clampPos(pos.x, pos.y); applyPos(); });
+    }
+    function savePos() {
+      try { localStorage.setItem(POS_KEY, JSON.stringify(pos)); } catch {}
+    }
+
+    // ---------- 拖动：pointer 事件 + 位移阈值区分点按 / 拖动 ----------
+    let suppressClick = false;
+    function initDrag() {
+      let startX = 0, startY = 0, dragging = false, pid = 0;
+      badge.addEventListener('pointerdown', (e) => {
+        if (e.button !== 0) return;
+        pid = e.pointerId;
+        startX = e.clientX; startY = e.clientY;
+        dragging = false;
+        badge.setPointerCapture(pid);
+      });
+      badge.addEventListener('pointermove', (e) => {
+        if (e.pointerId !== pid || !pos) return;
+        const dx = e.clientX - startX, dy = e.clientY - startY;
+        if (!dragging && Math.hypot(dx, dy) < 5) return;   // 阈值内视为点按
+        if (!dragging) {
+          dragging = true;
+          wrap.setAttribute('data-dragging', '1');
+          setOpen(false);                                    // 拖动时收起面板
+        }
+        pos = clampPos(e.clientX - BADGE_SIZE / 2, e.clientY - BADGE_SIZE / 2);
+        applyPos();
+      });
+      const end = (e) => {
+        if (e.pointerId !== pid) return;
+        try { badge.releasePointerCapture(pid); } catch {}
+        pid = 0;
+        if (dragging) {
+          dragging = false;
+          suppressClick = true;                              // 吞掉 pointerup 之后的 click
+          wrap.setAttribute('data-dragging', '0');
+          savePos();
+          setTimeout(() => { suppressClick = false; }, 0);
+        }
+      };
+      badge.addEventListener('pointerup', end);
+      badge.addEventListener('pointercancel', end);
     }
 
     function whenReady(fn) {
@@ -373,6 +476,14 @@ button { appearance: none; border: 0; background: transparent; font: inherit; co
       get current() { return { state: cur.state, text: cur.text, sub: cur.sub, open }; },
       /** 测试/调试用：直接控制面板开合。 */
       setOpen,
+      /** 徽标当前坐标（调试/E2E 用）。 */
+      get pos() { return pos ? { ...pos } : null; },
+      /** 恢复默认右上角位置。 */
+      resetPos() {
+        const vw = window.innerWidth || 1600;
+        pos = clampPos(vw - BADGE_SIZE - 14, 54);
+        applyPos(); savePos();
+      },
     };
   })();
 
