@@ -1,9 +1,9 @@
-/** 自动化页 E2E: 设置→「自动化」→ tab 空态渲染 (修复前 Method not found 报错) */
+/** 模型设置页 E2E: 设置→「模型设置」→ DeepSeek Relay provider 可见且无 RPC 报错 */
 import { launch, loginAndOpen, ev, click, openCommandPalette } from './e2e-lib.mjs';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { mkdtempSync, rmSync } from 'node:fs';
-const profile = mkdtempSync('/tmp/e2e-auto-');
-const client = await launch({ port: 9399, profile });
+const profile = mkdtempSync('/tmp/e2e-mp-');
+const client = await launch({ port: 9396, profile });
 const failExit = async (msg) => {
   console.log('FAIL ', msg);
   try { const body = await ev(client, 'document.body.innerText.slice(0,400)'); console.log(JSON.stringify(String(body).slice(0,250))); } catch {}
@@ -37,28 +37,28 @@ try {
   for (let w = 0; w < 20 && !nav; w++) {
     await sleep(1000);
     nav = await ev(client, `(() => {
-      const els = [...document.querySelectorAll('button, a, [role=button]')];
-      const el = els.find(e => /^\\s*自动化\\s*$/.test(e.textContent||''));
+      const els = [...document.querySelectorAll('[data-testid^=settings-section-nav]')];
+      const el = els.find(e => (e.getAttribute('aria-label')||'').trim() === '模型设置' || /^\\s*模型设置\\s*$/.test(e.textContent||''));
       if (!el) return null;
       const r = el.getBoundingClientRect();
       if (r.width === 0) return null;
       return { x: r.x + Math.min(r.width/2, 80), y: r.y + r.height/2 };
     })()`);
   }
-  if (!nav) await failExit('设置左栏「自动化」未找到');
+  if (!nav) await failExit('设置左栏「模型设置」未找到');
   await click(client, nav.x, nav.y);
   let ok = false; let val = null;
   for (let w = 0; w < 20 && !ok; w++) {
     await sleep(1000);
     val = await ev(client, `document.body.innerText`);
-    // 空态 + 新建入口, 且无 RPC 错误
-    ok = typeof val === 'string' && (val.includes('新建自动化') || /暂无/.test(val)) && !val.includes('Method not found');
+    // model-provider channel 真实数据: DeepSeek Relay + deepseek-v4-flash 模型
+    ok = typeof val === 'string' && val.includes('DeepSeek') && !val.includes('Method not found');
   }
   if (!ok) {
-    console.log('dbg 自动化 tab:', JSON.stringify(String(val).slice(0, 300)));
-    await failExit('未见自动化 tab 内容');
+    console.log('dbg 模型设置 tab:', JSON.stringify(String(val).slice(0, 300)));
+    await failExit('未见模型 provider 内容');
   }
-  console.log('PASS  自动化页渲染 (空态正常, 无 Method not found)');
+  console.log('PASS  模型设置页渲染 (DeepSeek Relay provider 可见, 无 Method not found)');
   try { client.kill(); } catch {}
   try { rmSync(profile, { recursive: true, force: true }); } catch {}
   process.exit(0);
