@@ -1,5 +1,5 @@
 /** 插件市场 E2E: 命令中心「MCP 服务器/插件市场」→ 市场列表渲染 (2 个市场, 320 可用插件) */
-import { launch, loginAndOpen, ev, click } from './e2e-lib.mjs';
+import { launch, loginAndOpen, ev, click, openCommandPalette } from './e2e-lib.mjs';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { mkdtempSync, rmSync } from 'node:fs';
 const profile = mkdtempSync('/tmp/e2e-pl-');
