@@ -1,5 +1,5 @@
 /** GitPane E2E: 命令面板「切换到差异面板」→ 源面板显示改动 → 文件行 diff 展开 */
-import { launch, loginAndOpen, ev, click } from './e2e-lib.mjs';
+import { launch, loginAndOpen, ev, click, openCommandPalette } from './e2e-lib.mjs';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { mkdtempSync, rmSync, writeFileSync, unlinkSync } from 'node:fs';
 const profile = mkdtempSync('/tmp/e2e-git-');
@@ -29,12 +29,7 @@ try {
     if (ok) break;
   }
   // 1. 命令中心 Ctrl+K → 「添加审查标签」打开 GitPane (side pane git tab)
-  await client.send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Control', code: 'ControlLeft', windowsVirtualKeyCode: 17 });
-  await client.send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'k', code: 'KeyK', windowsVirtualKeyCode: 75, modifiers: 2 });
-  await client.send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'k', code: 'KeyK', windowsVirtualKeyCode: 75, modifiers: 2 });
-  await client.send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Control', code: 'ControlLeft', windowsVirtualKeyCode: 17 });
-  await sleep(1000);
-  const palOpen = await ev(client, `!!document.querySelector('input[placeholder*=搜索操作]') || document.body.innerText.includes('搜索并执行')`);
+  const palOpen = await openCommandPalette(client);
   if (!palOpen) await failExit('命令面板未打开');
   await client.send('Input.insertText', { text: '审查标签' });
   await sleep(800);

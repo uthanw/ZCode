@@ -80,3 +80,39 @@ export async function click(client, x, y) {
   await sleep(80);
   await client.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button: 'left', clickCount: 1 });
 }
+
+/** Ctrl+K 打开命令中心 — 自带焦点前置 + 重试。
+ *  headless 下 Ctrl+K 偶发失灵 (焦点不在 body / app-server 冷启动慢), 单发不可靠。
+ *  判定: 「搜索并执行」文本出现 (面板标题固定文案)。 */
+export async function openCommandPalette(client, { attempts = 4 } = {}) {
+  for (let a = 0; a < attempts; a++) {
+    // 焦点前置: 点页面空白处, 保证 keydown 落到 body
+    await click(client, 700, 450);
+    await sleep(150);
+    await client.send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Control', code: 'ControlLeft', windowsVirtualKeyCode: 17 });
+    await client.send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'k', code: 'KeyK', windowsVirtualKeyCode: 75, modifiers: 2 });
+    await client.send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'k', code: 'KeyK', windowsVirtualKeyCode: 75, modifiers: 2 });
+    await client.send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Control', code: 'ControlLeft', windowsVirtualKeyCode: 17 });
+    await sleep(1200);
+    let open = await ev(client, `document.body.innerText.includes('搜索并执行')`);
+    if (!open) { await sleep(1000); open = await ev(client, `document.body.innerText.includes('搜索并执行')`); }
+    if (open) return true;
+    console.log(`openCommandPalette: 第 ${a} 次未开, 重试`);
+  }
+  return false;
+}
+
+/** 在已打开的命令面板里输入并点击匹配项 — 返回是否点击成功 */
+export async function palettePick(client, text, label) {
+  await client.send('Input.insertText', { text });
+  await sleep(900);
+  const item = await ev(client, `(() => {
+    const el = [...document.querySelectorAll('[role=option]')].find(e => (e.textContent||'').includes(${JSON.stringify(label)});
+    if (!el) return null;
+    const r = el.getBoundingClientRect();
+    return { x: r.x + r.width/2, y: r.y + r.height/2 };
+  })()`);
+  if (!item) return false;
+  await click(client, item.x, item.y);
+  return true;
+}

@@ -1,5 +1,5 @@
 /** MCP 服务器页 E2E: 命令中心「MCP 服务器」→ 页面渲染 (无 workspace MCP 时空态正常) */
-import { launch, loginAndOpen, ev, click } from './e2e-lib.mjs';
+import { launch, loginAndOpen, ev, click, openCommandPalette } from './e2e-lib.mjs';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { mkdtempSync, rmSync } from 'node:fs';
 const profile = mkdtempSync('/tmp/e2e-mcp-');
@@ -15,13 +15,7 @@ try {
   await loginAndOpen(client);
   for (let i = 0; i < 90; i++) { await sleep(1000); const ok = await ev(client, `!!document.querySelector('[data-testid^=task-item-]') || document.body.innerText.includes('暂无任务')`); if (ok) break; }
   // 命令中心 → 「MCP 服务器」(19 项列表里有)
-  await client.send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Control', code: 'ControlLeft', windowsVirtualKeyCode: 17 });
-  await client.send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'k', code: 'KeyK', windowsVirtualKeyCode: 75, modifiers: 2 });
-  await client.send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'k', code: 'KeyK', windowsVirtualKeyCode: 75, modifiers: 2 });
-  await client.send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Control', code: 'ControlLeft', windowsVirtualKeyCode: 17 });
-  await sleep(1200);
-  let palOpen = await ev(client, `document.body.innerText.includes('搜索并执行')`);
-  if (!palOpen) { await sleep(1500); palOpen = await ev(client, `document.body.innerText.includes('搜索并执行')`); }
+  const palOpen = await openCommandPalette(client);
   if (!palOpen) await failExit('命令面板未打开');
   await client.send('Input.insertText', { text: 'MCP' });
   await sleep(900);
