@@ -80,6 +80,18 @@ function fileService({ logger, workspaceRoot }) {
       const b = await fsp.readFile(p);
       return { dataBase64: b.toString('base64'), totalBytes: b.length };
     },
+    // PDF/大文件分片读取 (渲染器 HTt PDF 分支: 256KB 片拼接 → Uint8Array 下发)
+    async readFileRange({ path: p, offset, length } = {}) {
+      if (typeof p !== 'string') throw new Error('readFileRange: path required');
+      const off = Number.isFinite(offset) && offset > 0 ? Math.floor(offset) : 0;
+      const len = Number.isFinite(length) && length > 0 ? Math.floor(length) : 256 * 1024;
+      const fh = await fsp.open(p, 'r');
+      try {
+        const buf = Buffer.alloc(len);
+        const { bytesRead } = await fh.read(buf, 0, len, off);
+        return new Uint8Array(buf.buffer, buf.byteOffset, bytesRead);
+      } finally { await fh.close(); }
+    },
     async readMediaPreview({ path: p, maxBytes }) {
       const b = await fsp.readFile(p);
       const ext = path.extname(p).toLowerCase();
@@ -174,12 +186,34 @@ function fileService({ logger, workspaceRoot }) {
         : String(a.relativePath).localeCompare(String(b.relativePath))));
       return out;
     },
-    // 轻量文本读取 (设置页/命令文件预览)
-    async readTextFile({ path: p, maxBytes } = {}) {
+    // 文本预览 (右侧面板 code-viewer type='file')。
+    // 渲染器契约 (逆向 ETt/dTt): 入参 {path, offset=0, length}; 返回对象**整个**作为
+    // filePreview 存 state, dTt 消费 t.isBinary / t.content.length / t.content —
+    // content 或 isBinary 缺失会直接 "reading 'length'" 崩整个预览面板。
+    // truncated=true → ETt 走 fileTooLarge 分支 (ETt(t).fileTooLarge)。
+    async readTextFile({ path: p, offset, length } = {}) {
       if (typeof p !== 'string') throw new Error('readTextFile: path required');
-      const b = await fsp.readFile(p);
-      const sliced = Number.isFinite(maxBytes) && maxBytes > 0 ? b.subarray(0, maxBytes) : b;
-      return { text: sliced.toString('utf8'), totalBytes: b.length, truncated: sliced.length < b.length };
+      const st = await fsp.stat(p).catch(() => null);
+      if (!st || !st.isFile()) throw new Error(`ENOENT: no such file: ${p}`);
+      const off = Number.isFinite(offset) && offset > 0 ? Math.floor(offset) : 0;
+      const maxLen = Number.isFinite(length) && length > 0 ? Math.min(Math.floor(length), 1024 * 1024) : 256 * 1024;
+      const totalBytes = st.size;
+      if (off >= totalBytes) return { content: '', isBinary: false, truncated: false, totalBytes };
+      const fh = await fsp.open(p, 'r');
+      let buf;
+      try {
+        const want = Math.min(maxLen, totalBytes - off);
+        buf = Buffer.alloc(want);
+        const { bytesRead } = await fh.read(buf, 0, want, off);
+        buf = buf.subarray(0, bytesRead);
+      } finally { await fh.close(); }
+      // 二进制探测: 前 8KB 含 NUL 即视为二进制 (与 file(1) 启发式一致)
+      const probe = buf.subarray(0, 8192);
+      let isBinary = false;
+      for (let i = 0; i < probe.length; i++) { if (probe[i] === 0) { isBinary = true; break; } }
+      const truncated = off + buf.length < totalBytes;
+      if (isBinary) return { isBinary: true, truncated: false, totalBytes };
+      return { content: buf.toString('utf8'), isBinary: false, truncated, totalBytes };
     },
     // 二进制预览 (图片/音视频 attach 前的快速探测)
     async readBinaryPreview({ path: p, maxBytes } = {}) {
