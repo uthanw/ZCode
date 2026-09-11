@@ -88,13 +88,15 @@ try {
     await sleep(1000);
     pane = await ev(client, `(() => {
       const t = document.body.innerText;
-      if (!/[1-9]\\d*\\s*次调用/.test(t)) return null;
-      return { hasModel: t.includes('deepseek'), hasTokens: /输入|输出|token/i.test(t) };
+      const m = t.match(/(\\d+)\\s*次调用/);
+      if (!m) return null;
+      return { calls: m[1], hasModel: t.includes('deepseek'), hasTokens: /输入|输出|token/i.test(t) };
     })()`);
     if (pane) break;
   }
   if (!pane) { await failExit('轨迹面板未渲染'); }
-  console.log(`PASS  模型轨迹面板渲染 (model=${pane.hasModel} tokens=${pane.hasTokens})`);
+  console.log(`PASS  模型轨迹面板渲染 (calls=${pane.calls} model=${pane.hasModel} tokens=${pane.hasTokens})`);
+  if (pane.calls === '0') console.log('WARN  0 次调用 — 当前任务无 rollout 记录 (taskId 与 model-io 文件不匹配)');
   client.kill();
   try { rmSync(profile, { recursive: true, force: true }); } catch {}
   process.exit(0);
