@@ -451,15 +451,39 @@ function buildZCodeTaskService({ appServer, defaultWorkspace, logger, services, 
 }
 
 // ---------- ZCodeAgent channel ----------
+// ---- Web IDE 持久化状态 (与 index.js 的 web-ide-state.json 同源) ----
+const WEB_STATE_FILE = () => require('node:path').join(require('node:os').homedir(), '.zcode', 'web-ide-state.json');
+async function loadWebState() {
+  try { return JSON.parse(await require('node:fs/promises').readFile(WEB_STATE_FILE(), 'utf8')) ?? {}; }
+  catch { return {}; }
+}
+async function saveWebState(st) {
+  try {
+    const fsp = require('node:fs/promises');
+    await fsp.mkdir(require('node:path').dirname(WEB_STATE_FILE()), { recursive: true });
+    await fsp.writeFile(WEB_STATE_FILE(), JSON.stringify(st, null, 2));
+  } catch (e) { console.warn('[web-state] save failed:', e?.message ?? e); }
+}
+
 function buildZCodeAgentService({ appServer, defaultWorkspace, logger, configPath, services, hub }) {
   const restartEmitter = new Emitter();
   const lifecycleEmitter = new Emitter();
+  const lastRuntimeState = new Map(); // workspaceKey -> 最近一次下发的 runtime state
   // V4 conversation/controller 协议 —— 桥接渲染器 *V4 方法与 app-server v4/* 方法
   const { buildV4Methods, V4FrameHub } = require('./v4-protocol');
   const frameHub = new V4FrameHub(logger, defaultWorkspace);
   // app-server 的 v4 wire 帧通知 → frameHub → 渲染器 onDynamic* 事件
+  const diagFrameCounts = new Map();
+  setInterval(() => {
+    if (diagFrameCounts.size === 0) return;
+    const top = [...diagFrameCounts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 8);
+    if (top[0][1] >= 3) logger?.info?.('[diag-frames] ' + top.map(([k, v]) => `${k}=${v}`).join(' '));
+    diagFrameCounts.clear();
+  }, 15000).unref?.();
   appServer.onNotification((method, params) => {
     if (method === 'v4/conversation/frame' || method === 'v4/telemetry/event' || method === 'v4/cua/permission-observation') {
+      const dkey = method === 'v4/conversation/frame' ? (String(params?.topic ?? '').split('/')[0] || 'frame') : method.split('/').pop();
+      diagFrameCounts.set(dkey, (diagFrameCounts.get(dkey) || 0) + 1);
       frameHub.dispatch(method, params);
       // sessions-index 增量/快照 = 会话真实可见时刻 → hub 转给 windowController 重推快照
       if (method === 'v4/conversation/frame' && typeof params?.topic === 'string' && params.topic.startsWith('sessions-index/')) {
@@ -471,7 +495,15 @@ function buildZCodeAgentService({ appServer, defaultWorkspace, logger, configPat
     appServer, frameHub, logger, hub,
     configPath: configPath ?? require('node:path').join(require('node:os').homedir(), '.zcode/cli/config.json'),
     workspacePath: defaultWorkspace,
-    onRuntimeState: (wsKey, state) => lifecycleEmitter.fire({ workspaceKey: wsKey, state }),
+    onRuntimeState: (wsKey, state) => {
+      // [防抖] 同 workspace 同 state 不重复 fire —— 渲染器订阅风暴 (每秒多次
+      // resubscribe) 时, 重复的 'available' 事件会引发整棵 UI 树重渲染,
+      // 表现为输入框按钮 icon 集体闪烁。状态真实变化才下发。
+      const prev = lastRuntimeState.get(wsKey);
+      if (prev === state) return;
+      lastRuntimeState.set(wsKey, state);
+      lifecycleEmitter.fire({ workspaceKey: wsKey, state });
+    },
   });
   // app-server 进程死亡 → 所有活跃 workspace 的 runtime 不可用
   const knownWorkspaceKeys = () => {
@@ -540,6 +572,85 @@ function buildZCodeAgentService({ appServer, defaultWorkspace, logger, configPat
       catch { return { skills: [] }; }
     },
     async installPlugin(p) { return appServer.request('plugins/install', { workspace: normWs(p), pluginName: p.pluginName, marketplace: p.marketplace }, { timeoutMs: 120000 }); },
+    // ---- 自动化 (设置页「自动化」tab) ----
+    // 渲染器 automations store (E2) 直连本 channel: listAllAutomations/createAutomation/
+    // updateAutomation/deleteAutomation/runAutomationNow/listAutomationRuns/
+    // setAutomationEnabled/restartAutomation。桌面版由 host 的 cron 调度器实现;
+    // app-server 无对应 RPC (automation/* 是 CLI→host 反向请求), web 端无调度器 —
+    // 数据面用 web-ide-state 本地持久化, 列表/编辑/删除真实生效, 定时不执行。
+    async listAllAutomations() {
+      const st = await loadWebState();
+      return (st.automations ?? []).map((a) => ({
+        automationId: a.automationId, title: a.title, cronExpr: a.cronExpr ?? '',
+        prompt: a.prompt ?? '', enabled: a.enabled !== false,
+        lifecycleStatus: a.enabled !== false ? 'active' : 'paused',
+        nextRunAt: null, lastRunAt: a.lastRunAt ?? null, runCount: a.runCount ?? 0,
+        recurring: a.recurring !== false, maxRuns: a.maxRuns ?? null,
+        model: a.model ?? null, provider: a.provider ?? null,
+        mode: a.mode ?? undefined, thoughtLevel: a.thoughtLevel ?? undefined,
+        scheduleRule: a.scheduleRule ?? null,
+      }));
+    },
+    async createAutomation(p) {
+      const st = await loadWebState();
+      const list = st.automations ?? [];
+      if (list.length >= 20) throw new Error('[automation_limit_reached] automation limit reached');
+      const a = {
+        automationId: p?.automationId || `auto_${Date.now().toString(36)}`,
+        title: p?.title || '未命名自动化',
+        cronExpr: p?.cronExpr || '',
+        prompt: p?.prompt || '',
+        enabled: p?.enabled !== false,
+        recurring: p?.recurring !== false,
+        maxRuns: p?.maxRuns ?? null,
+        model: p?.model ?? null, provider: p?.provider ?? null,
+        mode: p?.mode, thoughtLevel: p?.thoughtLevel,
+        scheduleRule: p?.scheduleRule ?? null,
+        createdAt: Date.now(), runCount: 0, lastRunAt: null,
+      };
+      st.automations = [...list, a];
+      await saveWebState(st);
+      logger?.info?.('[automations] created', { automationId: a.automationId });
+      return a;
+    },
+    async updateAutomation(p) {
+      const st = await loadWebState();
+      const list = st.automations ?? [];
+      const idx = list.findIndex((a) => a.automationId === p?.automationId);
+      if (idx < 0) return { ok: false };
+      const { automationId, ...rest } = p;
+      for (const k of Object.keys(rest)) if (rest[k] !== undefined) list[idx][k] = rest[k];
+      st.automations = list; await saveWebState(st);
+      return { ok: true };
+    },
+    async deleteAutomation(p) {
+      const st = await loadWebState();
+      st.automations = (st.automations ?? []).filter((a) => a.automationId !== p?.automationId);
+      await saveWebState(st);
+      return { deleted: true };
+    },
+    async setAutomationEnabled(p) {
+      return this.updateAutomation({ automationId: p?.automationId, enabled: p?.enabled === true });
+    },
+    async restartAutomation(p) {
+      return this.updateAutomation({ automationId: p?.automationId, enabled: true });
+    },
+    async runAutomationNow(p) {
+      // 手动立即运行: web 端无调度器 — 记录一次运行时间, 返回 queued 让 UI 不报错
+      const st = await loadWebState();
+      const list = st.automations ?? [];
+      const a = list.find((x) => x.automationId === p?.automationId);
+      if (!a) throw new Error(`automation not found: ${p?.automationId}`);
+      a.runCount = (a.runCount ?? 0) + 1;
+      a.lastRunAt = Date.now();
+      st.automations = list; await saveWebState(st);
+      return { status: 'queued' };
+    },
+    async listAutomationRuns(p) {
+      const st = await loadWebState();
+      const a = (st.automations ?? []).find((x) => x.automationId === p?.automationId);
+      return { runs: a?.runs ?? [] };
+    },
     async addPluginMarketplace(p) { return appServer.request('plugins/marketplace/add', { workspace: normWs(p), source: p.source }, { timeoutMs: 120000 }); },
     // 市场刷新要从 github/cdn 拉目录，慢源首次可达 60s+ —— 给足超时，避免渲染器端一直转圈
     async updatePluginMarketplace(p) { return appServer.request('plugins/marketplace/update', { workspace: normWs(p), ...(p.marketplace ? { marketplace: p.marketplace } : {}) }, { timeoutMs: 180000 }); },
