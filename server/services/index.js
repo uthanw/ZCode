@@ -1486,7 +1486,17 @@ function buildAllChannels({ appServer, workspaceRoot, logger, configPath }) {
       },
     },
     [CHANNELS.PromptAttachmentTransfer]: { async begin() { return { ok: false }; }, async chunk() { return { ok: false }; }, async commit() { return { ok: false }; } },
-    [CHANNELS.OffPeakTask]: { async list() { return { tasks: [] }; } },
+    // 渲染器 offPeakStore: Promise.all([grayConfig, list, getCodingPlanSupport])
+    // → codingPlanActive===true || supported===true 才启用错峰面板; web 版无套餐 → 不支持
+    [CHANNELS.OffPeakTask]: {
+      async list() { return { tasks: [] }; },
+      async getGrayConfig() { return { enabled: false, codingPlanActive: false }; },
+      async getCodingPlanSupport() { return { supported: false }; },
+      async getTakeNumberAvailability() { return null; },
+      async getNewTaskBannerDismissed() { return true; },
+      async setNewTaskBannerDismissed() { return { ok: true }; },
+      async cancelPendingCreateDraft() { return { ok: true }; },
+    },
   };
 
   // 核心 agent 三件套 —— 对接 app-server（共享同一个 AgentEventHub）
