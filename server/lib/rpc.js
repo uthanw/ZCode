@@ -252,6 +252,9 @@ class ChannelServer {
     this.protocol = protocol; this.ctx = ctx; this.timeoutDelay = timeoutDelay; this.deferInit = deferInit;
     this.channels = new Map();
     this.activeRequests = new Map();
+    // 仅事件订阅（type=102）的 id 集合。断线重连后「业务状态是否一致」就看它：
+    // 订阅数掉到 0 意味着渲染器手里的 onDynamic* 事件流全成了死流，UI 会静默僵死。
+    this.eventRequests = new Set();
     this.pendingRequests = new Map();
     this.protocolListener = this.protocol.onMessage((buf) => this.onRawMessage(buf));
     if (!deferInit) this.sendResponse({ type: 200 });
@@ -327,6 +330,7 @@ class ChannelServer {
         this.sendResponse({ id: req.id, data, type: 204 });
       });
       this.activeRequests.set(req.id, sub);
+      this.eventRequests.add(req.id);
     } catch (e) {
       // 订阅失败不得抛出到消息循环（会终止进程）
       console.error(`[rpc] 事件订阅失败 ${req.channelName}.${req.name}:`, e?.message ?? e);
@@ -335,6 +339,7 @@ class ChannelServer {
   disposeActiveRequest(id) {
     const d = this.activeRequests.get(id);
     if (d) { d.dispose(); this.activeRequests.delete(id); }
+    this.eventRequests.delete(id);
   }
   collectPendingRequest(req) {
     const list = this.pendingRequests.get(req.channelName) ?? [];
@@ -363,6 +368,7 @@ class ChannelServer {
     this.protocolListener?.dispose(); this.protocolListener = null;
     for (const d of this.activeRequests.values()) d.dispose();
     this.activeRequests.clear();
+    this.eventRequests.clear();
   }
 }
 

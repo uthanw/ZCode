@@ -25,6 +25,7 @@ const AUTH_TOKEN = process.env.ZCODE_WEB_TOKEN || ''; // 可选 Bearer token
 
 const { WebSocketServer } = require('ws');
 const { Emitter, VSBuffer, ChannelServer, MessagePortProtocol, WebSocketMessagePort, fromService } = require('./lib/rpc.js');
+const { ResumableSession } = require('./lib/resumable.js');
 const { AppServerClient } = require('./lib/zcode-app-server.js');
 const { CHANNELS, buildAllChannels } = require('./services/index.js');
 
@@ -350,6 +351,12 @@ const server = http.createServer(async (req, res) => {
 const wss = new WebSocketServer({ noServer: true });
 const sessions = new Set();
 
+// 可恢复 RPC 会话池：cid（每次页面加载生成一次）→ { session, channelServer, protocol }
+// 断线重连时复用同一个 ChannelServer，保住事件订阅与进行中的请求（详见 lib/resumable.js 顶部说明）。
+const rpcSessions = new Map();
+const RESUME_GRACE_MS = Number(process.env.ZCODE_WEB_RESUME_GRACE_MS || 10 * 60 * 1000);
+const MAX_RESUMABLE_SESSIONS = Number(process.env.ZCODE_WEB_MAX_SESSIONS || 64);
+
 server.on('upgrade', (req, socket, head) => {
   const url = new URL(req.url, 'http://x');
   if (url.pathname !== '/rpc') { socket.destroy(); return; }
@@ -365,11 +372,54 @@ async function main() {
   const configPath = path.join(os.homedir(), '.zcode/cli/config.json');
   const services = buildAllChannels({ appServer, workspaceRoot: WORKSPACE_ROOT, logger, configPath });
 
-  wss.on('connection', (ws, req) => {
-    logger.info('RPC 客户端已连接', req.socket.remoteAddress);
-    const port = new WebSocketMessagePort(ws);
-    const protocol = new MessagePortProtocol(port);
-    const server_ = new ChannelServer(protocol, null, 1000, true /*deferInit*/);
+  // ---------- 业务层健康探针 ----------
+  // 「WebSocket 连上」≠「可以用了」：app-server 子进程可能已经死了，或者会话恢复后
+  // 订阅其实已经全丢。前端必须能在宣布「已连接」之前验证这两件事，所以这里给每个会话
+  // 挂一个专用 channel，由 port-shim 直接（绕过渲染器）发起真实 RPC 往返来验收。
+  let backendProbe = { at: 0, ok: false, error: '未探测' };
+  let backendInflight = null;
+  const BACKEND_TTL_MS = 3000;
+  function probeBackend() {
+    if (Date.now() - backendProbe.at < BACKEND_TTL_MS) return Promise.resolve(backendProbe);
+    if (backendInflight) return backendInflight;
+    backendInflight = (async () => {
+      let next;
+      try {
+        if (!appServer.proc || appServer.proc.exitCode !== null) throw new Error('app-server 进程已退出');
+        await appServer.request('workspace/readState', { workspace: WORKSPACE_ROOT }, { timeoutMs: 8000 });
+        next = { at: Date.now(), ok: true, error: '' };
+      } catch (e) {
+        next = { at: Date.now(), ok: false, error: String(e?.message || e).slice(0, 180) };
+      }
+      backendProbe = next;
+      backendInflight = null;
+      return next;
+    })();
+    return backendInflight;
+  }
+
+  function buildHealthService(session, channelServer) {
+    return {
+      async ping(arg) {
+        const backend = await probeBackend();
+        return {
+          ok: backend.ok,
+          ts: Date.now(),
+          echo: arg && arg.t,
+          appServer: backend.ok ? 'ok' : 'down',
+          appServerError: backend.ok ? undefined : backend.error,
+          // 本会话在服务端真实存活的**事件订阅**数（不含进行中的一次性请求）
+          subscriptions: channelServer.eventRequests.size,
+          inflight: channelServer.activeRequests.size,
+          channels: channelServer.channels.size,
+          transport: session.stats(),
+        };
+      },
+    };
+  }
+
+  /** 把服务表注册到一个 ChannelServer 上（含 model-provider 形状诊断包装）。 */
+  function registerServices(channelServer, session) {
     for (const [name, svc] of Object.entries(services)) {
       // 诊断：model-provider 的数组类方法返回时把形状摘要写进日志，
       // 用于核对渲染器收到的真实数据（排查形状契约 mismatches）。
@@ -391,20 +441,91 @@ async function main() {
             };
           }
         }
-        server_.registerChannel(name, fromService(wrapped));
+        channelServer.registerChannel(name, fromService(wrapped));
         continue;
       }
-      server_.registerChannel(name, fromService(svc));
+      channelServer.registerChannel(name, fromService(svc));
     }
-    server_.ready();
-    sessions.add(server_);
-    ws.on('close', () => { sessions.delete(server_); server_.dispose(); logger.info('RPC 客户端已断开'); });
+    channelServer.registerChannel('zcode-web-health', fromService(buildHealthService(session, channelServer)));
+  }
+
+  function destroySession(cid, reason) {
+    const entry = rpcSessions.get(cid);
+    if (!entry) return;
+    rpcSessions.delete(cid);
+    sessions.delete(entry.channelServer);
+    try { entry.channelServer.dispose(); } catch {}
+    try { entry.session.dispose(reason); } catch {}
+    logger.info(`RPC 会话已回收 cid=${cid} (${reason})，剩余 ${rpcSessions.size} 个`);
+  }
+
+  /** 会话数上限保护：优先淘汰已断开且最久未活动的会话。 */
+  function evictIfNeeded() {
+    while (rpcSessions.size >= MAX_RESUMABLE_SESSIONS) {
+      let victim = null;
+      for (const [cid, e] of rpcSessions) {
+        if (e.session.isAttached) continue;
+        if (!victim || e.session.lastActiveAt < victim.e.session.lastActiveAt) victim = { cid, e };
+      }
+      if (!victim) { // 全部在线：淘汰最老的一个，避免无界增长
+        const first = rpcSessions.keys().next();
+        if (first.done) return;
+        victim = { cid: first.value, e: rpcSessions.get(first.value) };
+      }
+      destroySession(victim.cid, '会话数超限淘汰');
+    }
+  }
+
+  wss.on('connection', (ws, req) => {
+    const url = new URL(req.url || '/rpc', 'http://x');
+    const cid = url.searchParams.get('cid') || `anon-${Math.random().toString(36).slice(2, 10)}`;
+    const clientRecv = Number(url.searchParams.get('recv') || 0) || 0;
+    ws.binaryType = 'nodebuffer';
+
+    const existing = rpcSessions.get(cid);
+    if (existing) {
+      const r = existing.session.attach(ws, clientRecv);
+      if (r.ok) {
+        logger.info(`RPC 客户端重连 cid=${cid} ${req.socket.remoteAddress} · ${JSON.stringify(existing.session.stats())}`);
+        return;
+      }
+      // attach 已把 resumed:false 告知客户端（它会整页重载并用新 cid 接入），这里直接回收。
+      logger.warn(`RPC 会话无法恢复 cid=${cid}: ${r.reason}`);
+      destroySession(cid, r.reason || 'not-resumable');
+      return;
+    }
+
+    // 客户端在恢复一个服务端已不存在的会话（最常见：服务重启过）。
+    // 直接告知不可恢复即可，不要为一个马上就要重载的页面白建一整套 ChannelServer。
+    if (url.searchParams.get('new') !== '1') {
+      logger.warn(`RPC 会话不存在 cid=${cid}（服务重启？），要求客户端重载`);
+      try { ws.send(JSON.stringify({ __zcodeRpcHello: 'v1', cid, resumed: false, recv: 0, reason: 'session-not-found' })); } catch {}
+      setTimeout(() => { try { ws.close(); } catch {} }, 200);
+      return;
+    }
+
+    evictIfNeeded();
+    logger.info(`RPC 客户端已连接 cid=${cid} ${req.socket.remoteAddress}`);
+    const session = new ResumableSession({
+      cid, logger, graceMs: RESUME_GRACE_MS,
+      onExpire: () => destroySession(cid, '宽限期超时'),
+    });
+    const protocol = new MessagePortProtocol(session);
+    const channelServer = new ChannelServer(protocol, null, 1000, true /*deferInit*/);
+    registerServices(channelServer, session);
+    channelServer.ready();
+
+    rpcSessions.set(cid, { session, protocol, channelServer });
+    sessions.add(channelServer);
+    // 首连：hello.resumed=false（客户端首连不会因此重载），随后重放 ready() 的初始化帧。
+    session.attach(ws, 0, true);
   });
 
   server.listen(PORT, HOST, () => {
     logger.info(`ZCode Web IDE: http://${HOST === '0.0.0.0' ? 'localhost' : HOST}:${PORT}`);
     logger.info(`工作区: ${WORKSPACE_ROOT}`);
     logger.info(`renderer: ${RENDERER_DIR}`);
+    logger.info(`RPC 会话保活: ${Math.round(RESUME_GRACE_MS / 1000)}s，最多 ${MAX_RESUMABLE_SESSIONS} 个`);
     // 后台预压缩（不阻塞启动，也不阻塞请求：请求命中未压完的文件会自行按需压缩）
     precompressAssets().catch((e) => logger.warn('预压缩失败:', e.message));
   });
