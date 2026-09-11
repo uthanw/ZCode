@@ -1583,7 +1583,82 @@ function buildAllChannels({ appServer, workspaceRoot, logger, configPath }) {
         async setBuiltInModelOverride() { return { ok: true }; },
       };
     })(),
-    [CHANNELS.Commands]: { async list() { return { commands: [] }; }, async updateCommandFile() { return { ok: true }; }, async writeCommandFile() { return { ok: true }; } },
+    // 渲染器 u_t(): t.list({workspacePath,workspaceIdentity}) → c3.setState({
+    //   commands, userCommands, pluginCommands, capability}) —— 四个字段都必须是数组,
+    //   缺失会让 commands tab setState undefined 并在 s_t 过滤时抛错。
+    //   app-server 无 commands RPC; 用户/插件命令目录扫描服务端合成。
+    [CHANNELS.Commands]: (() => {
+      let cache = null; let cacheAt = 0; let cacheDir = '';
+      const scanUserCommands = async (workspacePath) => {
+        const dirs = [
+          workspacePath ? path.join(workspacePath, '.zcode', 'commands') : null,
+          path.join(os.homedir(), '.zcode', 'cli', 'commands'),
+        ].filter(Boolean);
+        const out = [];
+        for (const dir of dirs) {
+          try {
+            const ents = await fsp.readdir(dir, { withFileTypes: true }).catch(() => []);
+            for (const ent of ents) {
+              if (!ent.isFile() || !ent.name.endsWith('.md')) continue;
+              const name = ent.name.replace(/\.md$/, '');
+              let description = '';
+              try {
+                const raw = await fsp.readFile(path.join(dir, ent.name), 'utf8');
+                const m = raw.match(/^---[\s\S]*?description:\s*(.+)$/m);
+                if (m) description = m[1].trim().replace(/^["']|["']$/g, '');
+              } catch {}
+              out.push({ id: `cmd:${dir}/${ent.name}`, name, description, path: path.join(dir, ent.name), source: 'user', enabled: true });
+            }
+          } catch {}
+        }
+        return out;
+      };
+      return {
+        async list(p) {
+          const dir = p?.workspacePath ?? '';
+          if (cacheDir === dir && Date.now() - cacheAt < 30000) return cache;
+          const userCommands = await scanUserCommands(p?.workspacePath);
+          cache = {
+            commands: [],               // 内置 slash 命令由渲染器从 workspace 状态合并
+            userCommands,
+            pluginCommands: [],         // 插件命令随 pluginCommands 走 plugin-management
+            capability: { supported: true },
+          };
+          cacheDir = dir; cacheAt = Date.now();
+          return cache;
+        },
+        async getCommand(p) {
+          const l = await this.list(p ?? {});
+          return l.userCommands.find((c) => c.name === (p?.name ?? p?.commandName)) ?? null;
+        },
+        async updateCommandFile() { cacheAt = 0; return { ok: true }; },
+        async writeCommandFile(p) {
+          // {workspacePath, name, content} → 写 workspace .zcode/commands/<name>.md
+          if (p?.workspacePath && p?.name && typeof p?.content === 'string') {
+            try {
+              const dir = path.join(p.workspacePath, '.zcode', 'commands');
+              await fsp.mkdir(dir, { recursive: true });
+              const safe = String(p.name).replace(/[^\w\u4e00-\u9fa5-]/g, '-');
+              await fsp.writeFile(path.join(dir, `${safe}.md`), p.content, 'utf8');
+              cacheAt = 0;
+              return { ok: true };
+            } catch (e) { return { ok: false, error: e?.message ?? 'write_failed' }; }
+          }
+          return { ok: false, error: 'invalid_params' };
+        },
+        async deleteCommandFile(p) {
+          if (p?.workspacePath && p?.name) {
+            try {
+              const safe = String(p.name).replace(/[^\w\u4e00-\u9fa5-]/g, '-');
+              await fsp.unlink(path.join(p.workspacePath, '.zcode', 'commands', `${safe}.md`));
+              cacheAt = 0;
+              return { ok: true };
+            } catch (e) { return { ok: false, error: e?.message ?? 'delete_failed' }; }
+          }
+          return { ok: false, error: 'invalid_params' };
+        },
+      };
+    })(),
     [CHANNELS.Hooks]: { async listHooks() { return { hooks: [] }; }, async loadHooks() { return { hooks: [] }; } },
     [CHANNELS.Memory]: { async loadMemory() { return { memory: null }; }, async saveMemory() { return { ok: true }; } },
     [CHANNELS.OutputStyle]: { async list() { return { styles: [] }; }, async getActive() { return null; } },
