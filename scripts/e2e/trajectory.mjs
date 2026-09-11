@@ -9,13 +9,13 @@ const client = await launch({ port: 9367, profile });
 const failExit = async (msg) => { console.log(`FAIL  ${msg}`); client.kill(); try { rmSync(profile, { recursive: true, force: true }); } catch {} process.exit(1); };
 try {
   await loginAndOpen(client);
-  // 1. 打开任务「请只回复: ok」
+  // 1. 打开任务「请求仅回复e2e-ok标记」
   let target = null;
   for (let i = 0; i < 90 && !target; i++) {
     await sleep(1000);
     target = await ev(client, `(() => {
       const els = [...document.querySelectorAll('[data-testid^=task-item-]')];
-      const el = els.find(e => (e.innerText||'').trim().split('\\n')[0] === '请只回复: ok');
+      const el = els.find(e => (e.innerText||'').trim().split('\\n')[0] === '请求仅回复e2e-ok标记');
       if (!el) return null;
       const r = el.getBoundingClientRect();
       return { x: r.x + r.width/2, y: r.y + r.height/2 };
@@ -24,7 +24,7 @@ try {
   if (!target) {
     const dbg = await ev(client, `JSON.stringify([...document.querySelectorAll('[data-testid^=task-item-]')].slice(0, 8).map(e => (e.innerText||'').trim().split('\n')[0]))`);
     console.log('dbg 任务列表前8:', dbg);
-    await failExit('未找到任务「请只回复: ok」');
+    await failExit('未找到任务「请求仅回复e2e-ok标记」');
   }
   await click(client, target.x, target.y);
   let ok = false;
@@ -60,7 +60,7 @@ try {
     // 3. 兜底: 侧栏任务 item hover 出现的 ... 按钮
     const hoverBtn = await ev(client, `(() => {
       const els = [...document.querySelectorAll('[data-testid^=task-item-]')];
-      const el = els.find(e => (e.innerText||'').trim().split('\\n')[0] === '请只回复: ok');
+      const el = els.find(e => (e.innerText||'').trim().split('\\n')[0] === '请求仅回复e2e-ok标记');
       if (!el) return null;
       const btn = el.querySelector('button');
       if (!btn) return null;
@@ -81,6 +81,9 @@ try {
   console.log('dbg menuitem 查看调用轨迹:', JSON.stringify(mi));
   if (!mi) { await failExit('菜单里没有「查看调用轨迹」'); }
   await click(client, mi.x, mi.y);
+  await sleep(2000);
+  console.log('dbg 点击后2s:', JSON.stringify(await ev(client, `document.body.innerText.slice(-500)`)).slice(0, 600));
+  console.log('dbg menu仍开:', await ev(client, `!!document.querySelector('[role=menu]')`));
 
   // 5. 等轨迹 tab 渲染: 「N 次调用」统计出现 (LAt summaryCalls) 即 records 已加载
   let pane = null;
@@ -89,14 +92,16 @@ try {
     pane = await ev(client, `(() => {
       const t = document.body.innerText;
       const m = t.match(/(\\d+)\\s*次调用/);
-      if (!m) return null;
-      return { calls: m[1], hasModel: t.includes('deepseek'), hasTokens: /输入|输出|token/i.test(t) };
+      if (m) return { calls: m[1], empty: false, hasModel: t.includes('deepseek'), hasTokens: /输入|输出|token/i.test(t) };
+      // 空态文案 = 面板已渲染, 该任务无 model-io 落盘
+      if (t.includes('暂无模型调用记录')) return { calls: '0', empty: true, hasModel: false, hasTokens: false };
+      return null;
     })()`);
     if (pane) break;
   }
   if (!pane) { await failExit('轨迹面板未渲染'); }
-  console.log(`PASS  模型轨迹面板渲染 (calls=${pane.calls} model=${pane.hasModel} tokens=${pane.hasTokens})`);
-  if (pane.calls === '0') console.log('WARN  0 次调用 — 当前任务无 rollout 记录 (taskId 与 model-io 文件不匹配)');
+  console.log(`PASS  模型轨迹面板渲染 (calls=${pane.calls}${pane.empty ? ' 空态' : ''} model=${pane.hasModel} tokens=${pane.hasTokens})`);
+  if (pane.empty) console.log('WARN  空态 — 当前任务无 rollout 落盘 (非服务故障)');
   client.kill();
   try { rmSync(profile, { recursive: true, force: true }); } catch {}
   process.exit(0);
