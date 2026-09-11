@@ -1427,7 +1427,55 @@ function buildAllChannels({ appServer, workspaceRoot, logger, configPath }) {
     },
     // nB(): (await list()) 的 t.code!==0 抛错 —— code:0 + data:[] = 空推荐
     [CHANNELS.ClientScenes]: { async getActiveScene() { return { scene: 'default' }; }, async list() { return { code: 0, msg: '', data: [] }; } },
-    [CHANNELS.Skills]: { async list() { return { skills: [] }; }, async get() { return null; } },
+    // ---------- Skills（设置页技能 tab + 各处 skill 徽标） ----------
+    // 渲染器 skills tab: N.list({workspacePath, workspaceIdentity, provider})
+    //   → {skills:[{id,name,description,path,scope,enabled}], capability, diagnostics:[]}
+    //   N.setEnabled / N.deleteSkill —— app-server 只提供 skills/referenceCatalog(只读),
+    //   启停/删除用 web state 本地标记, list 时把 disabled 标记叠加到 catalog 结果上。
+    [CHANNELS.Skills]: (() => {
+      let cache = null; let cacheAt = 0;
+      const catalog = async (p) => {
+        const ws = p?.workspacePath ? { workspacePath: p.workspacePath, workspaceKey: p.workspacePath } : defaultWorkspace;
+        if (!cache || Date.now() - cacheAt > 30000) {
+          try {
+            cache = await appServer.request('skills/referenceCatalog', { workspace: ws }, { timeoutMs: 30000 });
+            cacheAt = Date.now();
+          } catch { cache = cache ?? { skills: [] }; }
+        }
+        return cache;
+      };
+      const disabledSet = async () => {
+        const st = await loadWebState();
+        return new Set(Array.isArray(st.skillsDisabled) ? st.skillsDisabled : []);
+      };
+      return {
+        async list(p) {
+          const cat = await catalog(p);
+          const off = await disabledSet();
+          const skills = (cat?.skills ?? []).map((s) => ({ ...s, enabled: s.enabled !== false && !off.has(s.id) }));
+          return { skills, capability: cat?.capability ?? { supported: true }, diagnostics: [] };
+        },
+        async get(p) {
+          const cat = await catalog(p);
+          return (cat?.skills ?? []).find((s) => s.id === (p?.skillId ?? p?.id)) ?? null;
+        },
+        async setEnabled(p) {
+          const off = await disabledSet();
+          const id = p?.skillId;
+          if (typeof id === 'string' && id) {
+            if (p?.enabled === false) off.add(id); else off.delete(id);
+            const st = await loadWebState();
+            st.skillsDisabled = [...off];
+            await saveWebState(st);
+          }
+          return { ok: true };
+        },
+        async deleteSkill(p) {
+          // 真删用户 skill 文件风险高 —— 与禁用同等对待 (catalog 里标记为 disabled)
+          return this.setEnabled({ ...p, enabled: false });
+        },
+      };
+    })(),
     [CHANNELS.SkillSync]: { async sync() { return { ok: true }; } },
     [CHANNELS.McpSync]: {
       async sync() { return { ok: true }; },
