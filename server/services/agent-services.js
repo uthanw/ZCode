@@ -16,6 +16,10 @@ class AgentEventHub {
     this.subscribed = new Set();        // 已 session/subscribe 的 sessionId
     this.taskListChangedListeners = new Set();
     this.sessionsIndexFrameListeners = new Set();
+    // provider runtime headers 刷新握手 (interaction/requestProviderRuntimeHeaders)
+    const { Emitter: E } = require('../lib/rpc.js');
+    this.providerHeadersEmitter = new E();
+    this.providerHeadersPending = new Map(); // requestId -> resolve(response)
     appServer.onNotification((method, params) => this.onNotify(method, params));
     // server -> client 请求（requestRuntimePreferences / requestPermission 等）自动应答
     appServer.onRequest(async (method, params) => {
@@ -183,7 +187,18 @@ function buildZodeSessionService({ appServer, defaultWorkspace, logger, hub }) {
     async setWorkspaceDefaultThoughtLevel(p) {
       return appServer.request('workspace/setDefaultThoughtLevel', { workspace: normWs(p), thoughtLevel: p.thoughtLevel }, { timeoutMs: 30000 });
     },
-    async respondProviderRuntimeHeaders(p) { return { ok: true }; },
+    async respondProviderRuntimeHeaders(p) {
+      const resolve = hub.providerHeadersPending.get(p?.requestId);
+      if (resolve) {
+        hub.providerHeadersPending.delete(p?.requestId);
+        resolve({
+          headersApplied: !!p?.response?.headersApplied,
+          ...(p?.response?.errorMessage ? { errorMessage: p.response.errorMessage } : {}),
+          ...(p?.response?.providerRevision ? { providerRevision: p.response.providerRevision } : {}),
+        });
+      }
+      return { ok: true };
+    },
     async resolveRuntimeModelForView(p) { return null; },
     // v4-pane 预热会话: 失败/返回 null 时渲染器 "回落仅携带 config" —— null 即安全值
     async resolveRuntimeModelForV4(p) { return null; },
@@ -355,6 +370,7 @@ function buildZCodeTaskService({ appServer, defaultWorkspace, logger, services, 
 // ---------- ZCodeAgent channel ----------
 function buildZCodeAgentService({ appServer, defaultWorkspace, logger, configPath, services, hub }) {
   const restartEmitter = new Emitter();
+  const lifecycleEmitter = new Emitter();
   // V4 conversation/controller 协议 —— 桥接渲染器 *V4 方法与 app-server v4/* 方法
   const { buildV4Methods, V4FrameHub } = require('./v4-protocol');
   const frameHub = new V4FrameHub(logger, defaultWorkspace);
@@ -372,7 +388,17 @@ function buildZCodeAgentService({ appServer, defaultWorkspace, logger, configPat
     appServer, frameHub, logger, hub,
     configPath: configPath ?? require('node:path').join(require('node:os').homedir(), '.zcode/cli/config.json'),
     workspacePath: defaultWorkspace,
+    onRuntimeState: (wsKey, state) => lifecycleEmitter.fire({ workspaceKey: wsKey, state }),
   });
+  // app-server 进程死亡 → 所有活跃 workspace 的 runtime 不可用
+  const knownWorkspaceKeys = () => {
+    const keys = new Set([typeof defaultWorkspace === 'string' ? defaultWorkspace : defaultWorkspace?.workspacePath]);
+    for (const k of frameHub.subBindings.values()) keys.add(k);
+    return keys;
+  };
+  if (appServer.onExit) {
+    appServer.onExit(() => { for (const k of knownWorkspaceKeys()) lifecycleEmitter.fire({ workspaceKey: k, state: 'unavailable' }); });
+  }
   return {
     ...v4,
     // 原版 host syncAppRuntimePreferences: 存内存 + 推给所有已连接 workspace 的 app-server。
@@ -435,6 +461,11 @@ function buildZCodeAgentService({ appServer, defaultWorkspace, logger, configPat
     // 市场刷新要从 github/cdn 拉目录，慢源首次可达 60s+ —— 给足超时，避免渲染器端一直转圈
     async updatePluginMarketplace(p) { return appServer.request('plugins/marketplace/update', { workspace: normWs(p), ...(p.marketplace ? { marketplace: p.marketplace } : {}) }, { timeoutMs: 180000 }); },
     onAgentRuntimeRestarted: restartEmitter.event,
+    onAgentRuntimeLifecycle: lifecycleEmitter.event,
+    onDynamicWorkspaceProviderRuntimeHeadersRequest(arg) {
+      // 事件载荷补渲染器期望的 workspace 形状 ({workspacePath, workspaceIdentity?})
+      return hub.providerHeadersEmitter.event;
+    },
     // onDynamicCuaPermissionObservation 已由 v4 提供
   };
 }

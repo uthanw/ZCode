@@ -86,6 +86,8 @@ class V4FrameHub {
     }
   }
   unbindSubscription(subscriptionId) { this.subBindings.delete(subscriptionId); this.pendingFrames.delete(subscriptionId); }
+  /** 该 workspaceKey 是否仍有活跃订阅 */
+  hasSubscriptions(wsKey) { for (const v of this.subBindings.values()) if (v === wsKey) return true; return false; }
   _get(map, key) {
     let em = map.get(key);
     if (!em) { em = new Emitter(); map.set(key, em); }
@@ -129,7 +131,7 @@ class V4FrameHub {
  * 构建 zcode-agent channel 上的 V4 方法集。
  * ctx: { appServer, frameHub, logger, configPath, workspacePath, hub?, services? }
  */
-function buildV4Methods({ appServer, frameHub, logger, configPath, workspacePath, hub }) {
+function buildV4Methods({ appServer, frameHub, logger, configPath, workspacePath, hub, onRuntimeState }) {
   const A = (method, params) => appServer.request(method, params);
   /** 每 workspace 一次的 registry 同步 + connectionId */
   const connections = new Map(); // workspaceKey -> {connectionId, registrySynced}
@@ -201,11 +203,13 @@ function buildV4Methods({ appServer, frameHub, logger, configPath, workspacePath
       const ackSub = r?.ack?.subscriptionId ?? r?.subscriptionId;
       if (ackSub) frameHub.bindSubscription(ackSub, workspaceKey(m));
       logger?.info?.('[v4] subscribe ' + m.sessionId + ' sub=' + ackSub + ' ws=' + workspaceKey(m));
+      try { onRuntimeState?.(workspaceKey(m), 'available'); } catch {}
       return r;
     },
     async unsubscribeConversationV4(m) {
       const c = connectionFor(m);
       if (m?.subscriptionId) frameHub.unbindSubscription(m.subscriptionId);
+      try { onRuntimeState?.(workspaceKey(m), frameHub.hasSubscriptions(workspaceKey(m)) ? 'available' : 'idle'); } catch {}
       return A('v4/conversation/unsubscribe', {
         topic: `conversation/${m.sessionId}`,
         subscriptionId: m?.subscriptionId,

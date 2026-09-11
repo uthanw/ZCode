@@ -42,6 +42,7 @@ class AppServerClient {
       this.proc.on('error', (e) => { this._failAll(e); reject(e); });
       this.proc.on('close', (code) => {
         this._failAll(new Error(`app-server exited (code=${code})`));
+        this.exitEmitter?.fire(code);
       });
       // 等 stderr 出现启动迹象或直接 resolve —— app-server 无握手，直接可用
       resolve(this);
@@ -96,6 +97,8 @@ class AppServerClient {
   }
 
   onNotification(cb) { this.notifications.add(cb); return () => this.notifications.delete(cb); }
+  /** app-server 进程退出回调 (供上层清理/广播 runtime 状态) */
+  onExit(cb) { this.exitEmitter = this.exitEmitter ?? new (require('./rpc.js').Emitter)(); this.exitEmitter.event(cb); }
   onRequest(handler) { this.requestHandler = handler; }
 
   /** 发 JSON-RPC 请求。app-server 协议无 jsonrpc 字段: {id, method, params} */
