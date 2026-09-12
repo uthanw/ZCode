@@ -122,9 +122,19 @@ class AgentEventHub {
     if (method === 'session/requestRuntimePreferences') {
       return { askUserQuestionAutoResolutionEnabled: true, nativeSearchEnhancementsEnabled: true, memoryEnabled: false };
     }
-    // interaction/requestPermission 等一律批准（单人自用服务）
+    // v4 协议下，app-server 对权限/用户输入走双通道竞速（raceClientRequestWithV4Interaction）：
+    // 同一请求既注册为会话交互行（conversation frame → 渲染器弹窗，用户点击后经
+    // v4/command resolveInteraction 应答），又向 host 发 JSON-RPC 请求。
+    // host 在这里**必须悬置不应答**（与桌面 host 等待用户点击一致）：
+    //  - 若立刻回 `{decisions:[...]}`：形状不符合 app-server 的 strict schema
+    //    （期望 {decision:'allow'|'deny'|...}），resolveClientRequest 里 Zod parse 失败
+    //    → 请求 reject → 工具执行器 catch 兜底 = "Permission request failed" 直接 deny
+    //    → 弹窗一闪而过、模型侧看到被拒绝；
+    //  - 即便形状答对（allow）也会秒终结竞速，弹窗同样闪没。
+    // 悬置期间 app-server 每秒 reannounce（指数退避封顶 10s），用户点弹窗后它自行 abort
+    // 本请求（-32021），无超时风险（permissionTimeoutMs 默认未配置）。
     if (method === 'interaction/requestPermission' || method === 'interaction/requestUserInput') {
-      return { decisions: (params?.requests ?? []).map((r) => ({ requestId: r.requestId, decision: 'allow' })) };
+      return new Promise(() => {});
     }
     return {};
   }
@@ -465,7 +475,7 @@ async function saveWebState(st) {
   } catch (e) { console.warn('[web-state] save failed:', e?.message ?? e); }
 }
 
-function buildZCodeAgentService({ appServer, defaultWorkspace, logger, configPath, services, hub }) {
+function buildZCodeAgentService({ appServer, defaultWorkspace, logger, configPath, services, hub, uploadRegistry }) {
   const restartEmitter = new Emitter();
   const lifecycleEmitter = new Emitter();
   const lastRuntimeState = new Map(); // workspaceKey -> 最近一次下发的 runtime state
@@ -473,17 +483,8 @@ function buildZCodeAgentService({ appServer, defaultWorkspace, logger, configPat
   const { buildV4Methods, V4FrameHub } = require('./v4-protocol');
   const frameHub = new V4FrameHub(logger, defaultWorkspace);
   // app-server 的 v4 wire 帧通知 → frameHub → 渲染器 onDynamic* 事件
-  const diagFrameCounts = new Map();
-  setInterval(() => {
-    if (diagFrameCounts.size === 0) return;
-    const top = [...diagFrameCounts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 8);
-    if (top[0][1] >= 3) logger?.info?.('[diag-frames] ' + top.map(([k, v]) => `${k}=${v}`).join(' '));
-    diagFrameCounts.clear();
-  }, 15000).unref?.();
   appServer.onNotification((method, params) => {
     if (method === 'v4/conversation/frame' || method === 'v4/telemetry/event' || method === 'v4/cua/permission-observation') {
-      const dkey = method === 'v4/conversation/frame' ? (String(params?.topic ?? '').split('/')[0] || 'frame') : method.split('/').pop();
-      diagFrameCounts.set(dkey, (diagFrameCounts.get(dkey) || 0) + 1);
       frameHub.dispatch(method, params);
       // sessions-index 增量/快照 = 会话真实可见时刻 → hub 转给 windowController 重推快照
       if (method === 'v4/conversation/frame' && typeof params?.topic === 'string' && params.topic.startsWith('sessions-index/')) {
@@ -492,7 +493,7 @@ function buildZCodeAgentService({ appServer, defaultWorkspace, logger, configPat
     }
   });
   const v4 = buildV4Methods({
-    appServer, frameHub, logger, hub,
+    appServer, frameHub, logger, hub, uploadRegistry,
     configPath: configPath ?? require('node:path').join(require('node:os').homedir(), '.zcode/cli/config.json'),
     workspacePath: defaultWorkspace,
     onRuntimeState: (wsKey, state) => {

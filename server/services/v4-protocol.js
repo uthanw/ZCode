@@ -131,7 +131,7 @@ class V4FrameHub {
  * 构建 zcode-agent channel 上的 V4 方法集。
  * ctx: { appServer, frameHub, logger, configPath, workspacePath, hub?, services? }
  */
-function buildV4Methods({ appServer, frameHub, logger, configPath, workspacePath, hub, onRuntimeState }) {
+function buildV4Methods({ appServer, frameHub, logger, configPath, workspacePath, hub, onRuntimeState, uploadRegistry }) {
   const A = (method, params) => appServer.request(method, params);
   /** 每 workspace 一次的 registry 同步 + connectionId */
   const connections = new Map(); // workspaceKey -> {connectionId, registrySynced}
@@ -218,10 +218,15 @@ function buildV4Methods({ appServer, frameHub, logger, configPath, workspacePath
     },
     async resyncConversationV4(m) {
       const c = connectionFor(m);
+      // app-server 的 resync schema: base 必填且可空（object|null，非 optional）。
+      // 渲染器总是携带 base（对象或 null，null = 全量快照）；漏转发会触发 app-server
+      // Zod 校验失败 "expected object, received undefined"（path:["base"]），
+      // 且恢复流程反复重试、每次都失败，会话停留在 recovery 态无法收敛。
       return A('v4/conversation/resync', {
         topic: `conversation/${m.sessionId}`,
         subscriptionId: m?.subscriptionId,
         connectionId: c.connectionId,
+        base: m?.base ?? null,
         ...(m?.forceSnapshot !== undefined ? { forceSnapshot: m.forceSnapshot } : {}),
       });
     },
@@ -250,6 +255,18 @@ function buildV4Methods({ appServer, frameHub, logger, configPath, workspacePath
       // m: {workspacePath, workspaceIdentity?, remoteSessionId?, envelope}
       // v4/command params = envelope 本身
       await ensureRegistry(m);
+      // ---- Web 乐观上传闸门 ----
+      // 垫片 getPathForFile 对拖入文件同步返回 .uploads/<token>__<name> 的预测落盘路径
+      // （渲染器据此走 localZeroCopy），字节上传在后台进行。sendText 携带这类引用时，
+      // 必须等字节真正落盘后再转发给 app-server（它按零拷贝语义直接读这个路径）。
+      // 渲染器从不在 createSession.firstInput 里带附件（带附件的新会话一律
+      // createSession → 紧跟 sendText），所以只闸 sendText 即完备。
+      if (m?.envelope?.type === 'sendText' && uploadRegistry &&
+          Array.isArray(m.envelope.payload?.attachments) && m.envelope.payload.attachments.length) {
+        m.envelope.payload.attachments = await uploadRegistry.resolveAttachmentRefs(
+          m.envelope.payload.attachments,
+        );
+      }
       const res = await A('v4/command', m?.envelope);
       // 任务(≡会话)发生变化 → 通知渲染器任务列表实时刷新:
       //  - createSession → task_created;其余会话级命令(sendText/rename/compact/goal...) →
@@ -329,6 +346,10 @@ function buildV4Methods({ appServer, frameHub, logger, configPath, workspacePath
         connectionId: c.connectionId,
         clientMode: 'desktop-continuous',
         ...(m?.workspacePath || m?.workspaceIdentity ? { workspace: buildWorkspaceRef(m) } : {}),
+        // 注意 schema 不对称：subscribe 的 base 是 optional（缺省合法，null 非法），
+        // resync 的 base 是必填可空（必须显式 null）。不能统一——曾把 resync 的
+        // "必带 base" 推广到 subscribe，注入 base:null 导致 sessions-index 首次订阅
+        // 被 Zod 拒绝，侧栏会话状态增量断流（进行中转圈动画消失）。
         ...(m?.base !== undefined ? { base: m.base } : {}),
         ...(m?.visibility !== undefined ? { visibility: m.visibility } : {}),
       });
@@ -356,7 +377,7 @@ function buildV4Methods({ appServer, frameHub, logger, configPath, workspacePath
           topic: `sessions-index/${key}`,
           subscriptionId: m?.subscriptionId,
           connectionId: c.connectionId,
-          ...(m?.base !== undefined ? { base: m.base } : {}),
+          base: m?.base ?? null,
           ...(m?.forceSnapshot !== undefined ? { forceSnapshot: m.forceSnapshot } : {}),
         });
       } catch (e) { if (/Method not found/.test(e.message ?? '')) return {}; throw e; }
