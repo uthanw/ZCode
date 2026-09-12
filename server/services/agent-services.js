@@ -8,9 +8,12 @@ const { Emitter } = require('../lib/rpc');
 // 转发给渲染器的动态事件。桌面版是 per-session Emitter + seq 补齐；web 版做简化版：
 // 每条通知原样 fire 到对应 session/workspace 的事件流。
 class AgentEventHub {
-  constructor(appServer, logger) {
+  // opts.loadRuntimePreferences: async () => 共享设置（记忆/搜索增强/自动解析开关）。
+  // 桌面版此处回主进程的 app settings；web 版回 web-ide-settings.json 的内容。
+  constructor(appServer, logger, opts = {}) {
     this.appServer = appServer;
     this.logger = logger;
+    this.loadRuntimePreferences = opts.loadRuntimePreferences;
     this.sessionEmitters = new Map();   // sessionId -> Emitter
     this.workspaceEmitters = new Map(); // workspaceKey -> Emitter
     this.subscribed = new Set();        // 已 session/subscribe 的 sessionId
@@ -120,7 +123,21 @@ class AgentEventHub {
   async handleServerRequest(method, params) {
     // session/create / session/send 期间 app-server 会阻塞等待此应答，字段缺一不可
     if (method === 'session/requestRuntimePreferences') {
-      return { askUserQuestionAutoResolutionEnabled: true, nativeSearchEnhancementsEnabled: true, memoryEnabled: false };
+      // app-server 会话创建期间反向请求运行时偏好。schema（CLI MEt, .strict()）:
+      //   {nativeSearchEnhancementsEnabled: boolean, memoryEnabled: boolean,
+      //    askUserQuestionAutoResolutionEnabled: boolean,
+      //    integratedTerminalShell?: {mode:'auto'|{mode:'shell',...}}, modelContextBudgetStrategy?}
+      // memoryEnabled 直接决定会话是否挂载 project memory（记忆开关的真实生效点）。
+      let s = {};
+      try { s = (await this.loadRuntimePreferences?.()) ?? {}; } catch (e) { this.logger.warn?.('[runtime-prefs] load failed:', e?.message ?? e); }
+      const prefs = {
+        askUserQuestionAutoResolutionEnabled: s.askUserQuestionAutoResolutionEnabled !== false,
+        memoryEnabled: s.memoryEnabled === true,
+        nativeSearchEnhancementsEnabled: s.nativeSearchEnhancementsEnabled !== false,
+      };
+      const shell = s.integratedTerminalShell;
+      if (shell && typeof shell === 'object' && (shell.mode === 'auto' || shell.mode === 'shell')) prefs.integratedTerminalShell = shell;
+      return prefs;
     }
     // v4 协议下，app-server 对权限/用户输入走双通道竞速（raceClientRequestWithV4Interaction）：
     // 同一请求既注册为会话交互行（conversation frame → 渲染器弹窗，用户点击后经

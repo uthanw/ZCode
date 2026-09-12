@@ -1420,6 +1420,61 @@ function windowControllerService({ appServer, defaultWorkspace, logger, hub, ser
   };
 }
 
+// ---------- Memory（设置页「记忆」tab 的 viewer 数据源） ----------
+// 渲染器 BWt(): memoryService.listProjectMemories() → [{id, label, files:[{name, path, updatedAt}]}]
+//   * label 必须是**工作区路径**——渲染器 b9(label) slug 后与 recentProjects/打开的 tab 对账
+//     排序并替换显示名；对不上时原样显示 label。
+//   * files 的 path 是服务器绝对路径，行内「编辑器动作」直接拿去打开。
+// 存储位置（逆向自 CLI Yre()）: ~/.zcode/cli/memories/projects/<slug>-<sha256(key)[:16]>/memory，
+//   key = workspaceIdentity || resolve(workspacePath)，slug = sanitize(basename(resolve(path)))。
+//   目录名不可逆 → 用已知工作区路径（默认工作区 + conversation 工作区 + recentProjects）
+//   正算 hash 反查 label；查不到就剥掉 hash 后缀当 label。
+function memoryService({ logger, workspaceRoot }) {
+  const projectsDir = path.join(os.homedir(), '.zcode', 'cli', 'memories', 'projects');
+  const slugOf = (p) => p.toLowerCase().replace(/[^a-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 48) || 'project';
+  const hashOf = (wsPath, identity) => crypto
+    .createHash('sha256')
+    .update(String(identity || path.resolve(wsPath)))
+    .digest('hex').slice(0, 16);
+  return {
+    async listProjectMemories() {
+      const ents = await fsp.readdir(projectsDir, { withFileTypes: true }).catch(() => []);
+      const candidates = new Set([workspaceRoot, path.join(os.homedir(), '.zcode', 'workspace', 'default')]);
+      try {
+        const st = JSON.parse(await fsp.readFile(SETTING_FILE(), 'utf8'));
+        for (const p of st?.recentProjects ?? []) if (typeof p === 'string' && p.trim()) candidates.add(p.trim());
+      } catch { /* settings 缺失/损坏时仅用内置候选 */ }
+      const labelByDir = new Map();
+      for (const c of candidates) {
+        try { labelByDir.set(`${slugOf(path.basename(path.resolve(c)))}-${hashOf(c)}`, path.resolve(c)); } catch {}
+      }
+      const out = [];
+      for (const ent of ents) {
+        if (!ent.isDirectory()) continue;
+        const memDir = path.join(projectsDir, ent.name, 'memory');
+        const filesEnts = await fsp.readdir(memDir, { withFileTypes: true }).catch(() => null);
+        if (!filesEnts) continue; // 无 memory 子目录的 project 目录不展示
+        const files = [];
+        for (const f of filesEnts) {
+          if (!f.isFile() || !f.name.endsWith('.md')) continue;
+          try {
+            const st = await fsp.stat(path.join(memDir, f.name));
+            files.push({ name: f.name, path: path.join(memDir, f.name), updatedAt: st.mtimeMs });
+          } catch { /* 竞态跳过 */ }
+        }
+        // MEMORY.md 是索引，永远排第一；其余按名称排
+        files.sort((a, b) => (a.name === 'MEMORY.md' ? -1 : b.name === 'MEMORY.md' ? 1 : a.name.localeCompare(b.name)));
+        out.push({
+          id: ent.name,
+          label: labelByDir.get(ent.name) ?? ent.name.replace(/-[0-9a-f]{16}$/, ''),
+          files,
+        });
+      }
+      return out;
+    },
+  };
+}
+
 // ---------- 其余 stub（返回空对象/数组；事件 no-op）----------
 function stubService(name, methods) {
   const svc = {};
@@ -1542,51 +1597,161 @@ function buildAllChannels({ appServer, workspaceRoot, logger, configPath, upload
     },
     // ---------- Subagents（设置页子智能体 tab） ----------
     // 渲染器: H.list({workspacePath,workspaceIdentity,provider}) → eHt(e) =
-    // [...e.agents.filter(a=>a.source!=='plugin'), ...e.pluginAgents] + e.capability
-    //   H.setEnabled({agentId,enabled}) / H.updateAgent / H.createAgent / H.deleteAgent
-    // built-in 两个 (general-purpose, Explore) + workspace .zcode/agents/*.md 扫描;
-    // app-server 无 subagents RPC —— 服务端合成, 写操作落 web state 标记。
+    // [...e.agents.filter(a=>a.source!=='plugin'), ...e.pluginAgents] + e.capability.userScopeAvailable
+    //   H.setEnabled({agentId,enabled}) / H.updateAgent({agentId,config,oldFilePath,scope,...})
+    //   / H.createAgent({config,scope,workspacePath,...}) / H.deleteAgent({agentId,filePath})
+    //   / H.setBuiltInModelOverride({agentName,model,thoughtLevel})
+    // 编辑表单 N7(e) 直接消费 list 返回的 agent 对象全量字段（name/description/color/model/
+    //   thoughtLevel/injectAgentsMd/tools/systemPrompt/...），故必须解析 frontmatter。
+    // 目录与 CLI Fcn() 对齐: user → ~/.zcode/agents, project → <workspace>/.zcode/agents;
+    //   文件格式与 CLI Z0t() 对齐: frontmatter(name/description 必填) + 正文=systemPrompt。
+    // app-server 无 subagents RPC —— built-in 两个 + 目录扫描合成；写操作直接落 .md 文件。
     [CHANNELS.Subagents]: (() => {
+      const userAgentsDir = path.join(os.homedir(), '.zcode', 'agents');
       const BUILTINS = [
-        { id: 'builtin:general-purpose', name: 'general-purpose', description: '通用子智能体, 适合需要多步骤、搜索与工具调用的复杂任务', scope: 'built-in', source: 'built-in', readOnly: true, enabled: true },
-        { id: 'builtin:explore', name: 'Explore', description: '只读探索子智能体, 用于代码库调研与信息收集', scope: 'built-in', source: 'built-in', readOnly: true, enabled: true },
+        {
+          id: 'builtin:general-purpose', name: 'general-purpose', scope: 'built-in', source: 'built-in',
+          description: '通用子智能体, 适合需要多步骤、搜索与工具调用的复杂任务', systemPrompt: '',
+          tools: ['Bash', 'Glob', 'Grep', 'Read', 'WebFetch', 'WebSearch', 'TodoWrite'], injectAgentsMd: true,
+          readOnly: true, enabled: true,
+        },
+        {
+          id: 'builtin:explore', name: 'Explore', scope: 'built-in', source: 'built-in',
+          description: '只读探索子智能体, 用于代码库调研与信息收集', systemPrompt: '',
+          tools: ['*'], injectAgentsMd: true,
+          readOnly: true, enabled: true,
+        },
       ];
-      let wsCache = null; let wsCacheAt = 0; let wsCacheDir = '';
-      const scanWorkspaceAgents = async (workspacePath) => {
-        if (!workspacePath) return [];
-        if (wsCacheDir === workspacePath && Date.now() - wsCacheAt < 30000) return wsCache;
+      // ---- frontmatter 解析（CLI Rti() 的简化镜像：单行 kv + block/flow 列表 + 裸标量）----
+      const scalar = (v) => {
+        v = v.trim();
+        if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) return v.slice(1, -1);
+        if (v.startsWith('[') && v.endsWith(']')) return v.slice(1, -1).split(',').map((x) => scalar(x)).filter((x) => x !== '');
+        if (v === 'true') return true;
+        if (v === 'false') return false;
+        return v;
+      };
+      const parseAgentMd = (raw) => {
+        const m = raw.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/);
+        if (!m) return { values: {}, systemPrompt: raw.trim() };
+        const values = {};
+        let curKey = null;
+        for (const line of m[1].split(/\r?\n/)) {
+          if (!line.trim() || line.trim().startsWith('#')) continue;
+          const li = line.match(/^\s*-\s+(.*)$/);
+          if (li && curKey) {
+            if (!Array.isArray(values[curKey])) values[curKey] = [];
+            values[curKey].push(scalar(li[1]));
+            continue;
+          }
+          curKey = null;
+          const kv = line.match(/^([A-Za-z][A-Za-z0-9_-]*)\s*:\s*(.*)$/);
+          if (!kv) continue;
+          const v = kv[2].trim();
+          if (v === '') { values[kv[1]] = []; curKey = kv[1]; continue; }
+          values[kv[1]] = scalar(v);
+        }
+        return { values, systemPrompt: m[2].trim() };
+      };
+      const fmtScalar = (v) => (/[:#\n]/.test(String(v)) ? JSON.stringify(String(v)) : String(v));
+      // config（渲染器 onSubmit 组装）→ .md 文本。字段取舍与 CLI 解析端一致：
+      // undefined/空数组不写（CLI 端"缺省=继承全部工具"）。
+      const agentMd = (config) => {
+        const lines = ['---'];
+        lines.push(`name: ${fmtScalar(config.name)}`);
+        lines.push(`description: ${fmtScalar(String(config.description ?? '').replace(/\r?\n/g, ' '))}`);
+        if (config.color) lines.push(`color: ${fmtScalar(config.color)}`);
+        if (config.model) lines.push(`model: ${fmtScalar(config.model)}`);
+        if (config.thoughtLevel) lines.push(`thoughtLevel: ${fmtScalar(config.thoughtLevel)}`);
+        if (config.permissionMode) lines.push(`permissionMode: ${fmtScalar(config.permissionMode)}`);
+        if (Number.isFinite(Number(config.maxTurns)) && Number(config.maxTurns) > 0) lines.push(`maxTurns: ${Number(config.maxTurns)}`);
+        const listKeys = ['tools', 'disallowedTools', 'skills', 'mcpServers'];
+        for (const k of listKeys) {
+          const arr = Array.isArray(config[k]) ? config[k].filter((x) => String(x).length > 0) : [];
+          if (!arr.length) continue;
+          lines.push(`${k}:`);
+          for (const item of arr) lines.push(`  - ${fmtScalar(item)}`);
+        }
+        if (config.background !== undefined) lines.push(`background: ${config.background === true ? 'true' : 'false'}`);
+        if (config.injectAgentsMd !== undefined) lines.push(`injectAgentsMd: ${config.injectAgentsMd === true ? 'true' : 'false'}`);
+        lines.push('---', '');
+        return lines.join('\n') + String(config.systemPrompt ?? '');
+      };
+      const profileFromFile = (raw, filePath, scope) => {
+        const { values, systemPrompt } = parseAgentMd(raw);
+        const name = (typeof values.name === 'string' && values.name) || path.basename(filePath, '.md');
+        const listOrUndef = (v) => (Array.isArray(v) && v.length ? v : undefined);
+        return {
+          id: `${scope}:${path.basename(filePath)}`,
+          name,
+          description: typeof values.description === 'string' ? values.description : '',
+          systemPrompt,
+          color: typeof values.color === 'string' ? values.color : undefined,
+          model: typeof values.model === 'string' ? values.model : undefined,
+          thoughtLevel: typeof values.thoughtLevel === 'string' ? values.thoughtLevel : undefined,
+          tools: listOrUndef(values.tools),
+          disallowedTools: listOrUndef(values.disallowedTools),
+          skills: listOrUndef(values.skills),
+          mcpServers: listOrUndef(values.mcpServers),
+          permissionMode: typeof values.permissionMode === 'string' ? values.permissionMode : undefined,
+          maxTurns: Number.isFinite(Number(values.maxTurns)) && Number(values.maxTurns) > 0 ? Number(values.maxTurns) : undefined,
+          background: typeof values.background === 'boolean' ? values.background : undefined,
+          injectAgentsMd: typeof values.injectAgentsMd === 'boolean' ? values.injectAgentsMd : undefined,
+          path: filePath,
+          ...(scope === 'workspace' ? { projectPath: path.dirname(path.dirname(filePath)) } : {}),
+          scope, source: 'user', readOnly: false, enabled: true,
+        };
+      };
+      let dirCache = null; let dirCacheAt = 0; let dirCacheKey = '';
+      const scanAgentFiles = async (workspacePath) => {
+        const key = String(workspacePath ?? '');
+        if (dirCacheKey === key && Date.now() - dirCacheAt < 30000) return dirCache;
         const out = [];
-        try {
-          const dir = path.join(workspacePath, '.zcode', 'agents');
+        const dirs = [
+          { dir: userAgentsDir, scope: 'user' },
+          ...(workspacePath ? [{ dir: path.join(workspacePath, '.zcode', 'agents'), scope: 'workspace' }] : []),
+        ];
+        for (const { dir, scope } of dirs) {
           const ents = await fsp.readdir(dir, { withFileTypes: true }).catch(() => []);
           for (const ent of ents) {
             if (!ent.isFile() || !ent.name.endsWith('.md')) continue;
-            const id = `workspace:${ent.name}`;
-            let description = '';
             try {
               const raw = await fsp.readFile(path.join(dir, ent.name), 'utf8');
-              const m = raw.match(/^---[\s\S]*?description:\s*(.+)$/m);
-              if (m) description = m[1].trim().replace(/^["']|["']$/g, '');
-            } catch {}
-            out.push({ id, name: ent.name.replace(/\.md$/, ''), description, path: path.join(dir, ent.name), scope: 'workspace', source: 'user', readOnly: false, enabled: true });
+              out.push(profileFromFile(raw, path.join(dir, ent.name), scope));
+            } catch { /* 读失败跳过 */ }
           }
-        } catch {}
-        wsCache = out; wsCacheAt = Date.now(); wsCacheDir = workspacePath;
+        }
+        dirCache = out; dirCacheAt = Date.now(); dirCacheKey = key;
         return out;
       };
       const disabledSet = async () => {
         const st = await loadWebState();
         return new Set(Array.isArray(st.subagentsDisabled) ? st.subagentsDisabled : []);
       };
-      const allAgents = async (p) => {
-        const off = await disabledSet();
-        const wsAgents = await scanWorkspaceAgents(p?.workspacePath);
-        return [...BUILTINS, ...wsAgents].map((a) => ({ ...a, enabled: a.enabled !== false && !off.has(a.id) }));
+      const builtInOverrides = async () => {
+        const st = await loadWebState();
+        const ov = st.subagentsBuiltInModelOverrides;
+        return ov && typeof ov === 'object' && !Array.isArray(ov) ? ov : {};
       };
+      const allAgents = async (p) => {
+        const [off, ov] = await Promise.all([disabledSet(), builtInOverrides()]);
+        const fileAgents = await scanAgentFiles(p?.workspacePath);
+        const builtins = BUILTINS.map((a) => {
+          const o = ov[a.name];
+          if (!o || typeof o !== 'object') return a;
+          return { ...a, ...(o.model ? { model: o.model } : {}), ...(o.thoughtLevel ? { thoughtLevel: o.thoughtLevel } : {}) };
+        });
+        return [...builtins, ...fileAgents].map((a) => ({ ...a, enabled: a.enabled !== false && !off.has(a.id) }));
+      };
+      // scope → 落盘目录。渲染器保证 name 合法（3-50 位 [a-zA-Z0-9-]），服务端再防御一次。
+      const targetDir = (scope, workspacePath) => (scope === 'workspace' && workspacePath
+        ? path.join(workspacePath, '.zcode', 'agents')
+        : userAgentsDir);
+      const safeName = (n) => String(n ?? '').replace(/[^a-zA-Z0-9-]/g, '-').replace(/^-+|-+$/g, '') || 'agent';
       return {
         async list(p) {
           const agents = await allAgents(p);
-          return { agents, pluginAgents: [], capability: { supported: true } };
+          return { agents, pluginAgents: [], capability: { supported: true, userScopeAvailable: true } };
         },
         async getAgent(p) {
           const agents = await allAgents(p);
@@ -1603,18 +1768,54 @@ function buildAllChannels({ appServer, workspaceRoot, logger, configPath, upload
           }
           return { ok: true };
         },
+        async createAgent(p) {
+          const c = p?.config;
+          if (!c?.name || !c?.description) return { ok: false, error: 'invalid_params' };
+          const dir = targetDir(p?.scope === 'workspace' ? 'workspace' : 'user', p?.workspacePath);
+          await fsp.mkdir(dir, { recursive: true });
+          await fsp.writeFile(path.join(dir, `${safeName(c.name)}.md`), agentMd(c), 'utf8');
+          dirCacheAt = 0;
+          return { ok: true };
+        },
+        async updateAgent(p) {
+          const c = p?.config;
+          if (!c?.name || !c?.description) return { ok: false, error: 'invalid_params' };
+          const dir = targetDir(p?.scope === 'workspace' ? 'workspace' : 'user', p?.workspacePath);
+          await fsp.mkdir(dir, { recursive: true });
+          const newPath = path.join(dir, `${safeName(c.name)}.md`);
+          await fsp.writeFile(newPath, agentMd(c), 'utf8');
+          // 改名编辑: 旧文件清理（oldFilePath 与新路径不同才是改名，避免自我删除）
+          const oldPath = p?.oldFilePath;
+          if (typeof oldPath === 'string' && oldPath.endsWith('.md') && path.resolve(oldPath) !== path.resolve(newPath)) {
+            await fsp.unlink(oldPath).catch(() => {});
+          }
+          dirCacheAt = 0;
+          return { ok: true };
+        },
         async deleteAgent(p) {
-          // workspace 级用户 agent: 直接删 .md 文件; built-in 仅做禁用标记
-          const agents = await allAgents(p);
-          const a = agents.find((x) => x.id === p?.agentId);
-          if (a?.path?.endsWith('.md') && a.source === 'user') {
-            try { await fsp.unlink(a.path); wsCacheAt = 0; return { ok: true }; } catch {}
+          // 用户/工作区 .md 直接删; built-in 无文件 → 落禁用标记兜底
+          const fp = p?.filePath;
+          if (typeof fp === 'string' && fp.endsWith('.md')) {
+            try { await fsp.unlink(fp); dirCacheAt = 0; return { ok: true }; } catch { /* 落到禁用兜底 */ }
           }
           return this.setEnabled({ ...p, enabled: false });
         },
-        async updateAgent() { return { ok: true }; },
-        async createAgent() { return { ok: true }; },
-        async setBuiltInModelOverride() { return { ok: true }; },
+        // built-in 两个 agent 的模型/思考级别覆盖（渲染器仅对 general-purpose/Explore 出入口）。
+        // 桌面版经 app-server 会话配置下发; web 版先持久化到 web state 并在 list 上叠加,
+        // 保证设置页回显正确（会话侧生效依赖 app-server 透传，暂不接）。
+        async setBuiltInModelOverride(p) {
+          if (typeof p?.agentName !== 'string' || !p.agentName) return { ok: false, error: 'invalid_params' };
+          const st = await loadWebState();
+          const ov = (st.subagentsBuiltInModelOverrides && typeof st.subagentsBuiltInModelOverrides === 'object' && !Array.isArray(st.subagentsBuiltInModelOverrides))
+            ? { ...st.subagentsBuiltInModelOverrides } : {};
+          const cur = (ov[p.agentName] && typeof ov[p.agentName] === 'object') ? { ...ov[p.agentName] } : {};
+          if (p.model) cur.model = p.model; else delete cur.model;
+          if (p.thoughtLevel) cur.thoughtLevel = p.thoughtLevel; else delete cur.thoughtLevel;
+          if (Object.keys(cur).length) ov[p.agentName] = cur; else delete ov[p.agentName];
+          st.subagentsBuiltInModelOverrides = ov;
+          await saveWebState(st);
+          return { ok: true };
+        },
       };
     })(),
     // 渲染器 u_t(): t.list({workspacePath,workspaceIdentity}) → c3.setState({
@@ -1694,7 +1895,7 @@ function buildAllChannels({ appServer, workspaceRoot, logger, configPath, upload
       };
     })(),
     [CHANNELS.Hooks]: { async listHooks() { return { hooks: [] }; }, async loadHooks() { return { hooks: [] }; } },
-    [CHANNELS.Memory]: { async loadMemory() { return { memory: null }; }, async saveMemory() { return { ok: true }; } },
+    [CHANNELS.Memory]: memoryService({ logger, workspaceRoot }),
     [CHANNELS.OutputStyle]: { async list() { return { styles: [] }; }, async getActive() { return null; } },
     [CHANNELS.SettingsSync]: settingsSyncService(),
     [CHANNELS.Bots]: { async syncAppRuntimePreferences() { return { ok: true }; } },
@@ -1733,7 +1934,13 @@ function buildAllChannels({ appServer, workspaceRoot, logger, configPath, upload
   };
 
   // 核心 agent 三件套 —— 对接 app-server（共享同一个 AgentEventHub）
-  const sharedHub = new AgentEventHub(appServer, logger);
+  // requestRuntimePreferences 回共享设置（web-ide-settings.json）：记忆开关等在此真实生效
+  const sharedHub = new AgentEventHub(appServer, logger, {
+    loadRuntimePreferences: async () => {
+      try { return { ...DEFAULT_SETTINGS, ...JSON.parse(await fsp.readFile(SETTING_FILE(), 'utf8')) }; }
+      catch { return { ...DEFAULT_SETTINGS }; }
+    },
+  });
   Object.assign(services, {
     [CHANNELS.ZCodeSession]: buildZodeSessionService({ appServer, defaultWorkspace, logger, hub: sharedHub }),
     [CHANNELS.ZCodeTask]: buildZCodeTaskService({ appServer, defaultWorkspace, logger, services, hub: sharedHub }),
