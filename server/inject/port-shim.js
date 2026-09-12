@@ -15,9 +15,12 @@
   // 渲染器入口读 URLSearchParams(location.search)。Web 版在 shim（entry 之前同步执行）
   // 里用 history.replaceState 注入默认工作区，保证 Root 的 tJt bootstrap 能建首个
   // workspace tab（否则 skip 登录后 Ft=null → Root 渲染 null → 白屏）。
+  // WORKSPACE_ROOT 由服务端 serveHtml 注入到 window.__ZCODE_WEB_WORKSPACE__（下方
+  // 乐观路径的落盘路径预测也读它）。取不到配置值时留空串 —— 宁可启动失败也不要
+  // 静默指向一个不存在的机器路径。
+  var __ws = window.__ZCODE_WEB_WORKSPACE__ || '';
   try {
-    if (!/[?&]initialWorkspacePath=/.test(window.location.search)) {
-      var __ws = (window.__ZCODE_WEB_WORKSPACE__ || '/root/zcode-web-service/workspace');
+    if (__ws && !/[?&]initialWorkspacePath=/.test(window.location.search)) {
       var __sep = window.location.search ? '&' : '?';
       window.history.replaceState(null, '', window.location.pathname + window.location.search + __sep + 'initialWorkspacePath=' + encodeURIComponent(__ws));
     }
@@ -120,15 +123,11 @@
     loadMcpFromUserDirectory: OK({ mcpServers: {} }),
     saveMcpToUserDirectory: OK({ success: true }),
     migrateLegacyCommonMcp: OK({ migrated: false }),
-    // 文件对话框：浏览器拿不到绝对路径，返回 null = 用户取消
+    // 文件对话框：selectDirectory 无 Web 语义（不能浏览服务器目录树），保持 null；
+    // selectFile/selectFiles 由下方「文件上传桥」实现：弹原生选择器 → 上传 → 服务器路径。
     selectDirectory: OK(null),
-    selectFile: OK(null),
-    createTempTextAttachment: OK(null),
     // 桌面集成
-    openInEditor: OK(UNSUPPORTED),
-    openInFileManager: OK(UNSUPPORTED),
     executeDesktopCommand: OK(UNSUPPORTED),
-    getInstalledEditors: OK([]),
     canOpenCommunity: OK(false),
     exportLogs: OK(UNSUPPORTED),
     // 遥测：Web 端不外发
@@ -140,10 +139,609 @@
     // 性能追踪
     startPerformanceTrace: OK(UNSUPPORTED),
     stopPerformanceTrace: OK(UNSUPPORTED),
+    // 「用编辑器打开」菜单：Web 端无本地编辑器可枚举；保留空列表（菜单显示「无可用打开方式」，
+    // 主按钮与 revealInFileManager 仍走下载桥）
+    getInstalledEditors: OK([]),
   });
 
-  // getPathForFile：桌面版用 webUtils 拿拖入文件的绝对路径；Web 端无此能力，返回 null
-  zcode.getPathForFile = zcode.getPathForFile || (() => null);
+  // ==========================================================================
+  // 文件上传/下载桥 —— 把桌面的「本地文件路径」语义映射为 Web 的「HTTP 传输 + 服务器路径」
+  // --------------------------------------------------------------------------
+  // 桌面版语义（渲染器 bundle 固化，不可改）：
+  //  * 拖拽文件: f.getPathForFile(file) **同步**返回绝对路径 → 附件状态机判定
+  //    localZeroCopy（本地工作区）→ 发送时 ref=绝对路径，app-server 自己读盘。
+  //  * 回形针按钮: canSelectFilePath:!0 硬编码 → xIe(f) → await selectFiles() → 路径数组。
+  //  * 粘贴长文本: createTempTextAttachment({text,filename}) → 临时文件路径。
+  //  * 「在文件管理器中打开」/「用编辑器打开」: openInFileManager / openInEditor。
+  //
+  // Web 语义映射（本桥 + server/web-server.mjs 的 /upload /upload-text /download 端点）：
+  //  * getPathForFile: 同步契约没法先上传 → **乐观路径**。同步返回预测落盘路径
+  //    <workspace>/.uploads/<token>__<safeName>（渲染器视为本地文件 → localZeroCopy），
+  //    同时立刻 XHR POST /upload 送字节（带进度）。sendText 时服务端闸门等字节真正
+  //    落盘后才转发 app-server，竞态为零。
+  //  * selectFile/selectFiles: 弹 <input type=file> → 逐个 await 上传 → 路径数组。
+  //  * createTempTextAttachment: POST /upload-text → 临时文件路径。
+  //  * openInFileManager/openInEditor: 隐藏 <a download> 触发浏览器下载该路径。
+  //    目录（pathKind:'directory'）无下载语义 → 直接报不支持（原生对目录也是打开面板）。
+  // ==========================================================================
+  async function httpJson(url, opts) {
+    const r = await fetch(url, opts);
+    const txt = await r.text();
+    let j = null;
+    try { j = JSON.parse(txt); } catch { j = null; }
+    if (!r.ok || !j || j.ok === false) {
+      const err = new Error('web-bridge ' + r.status + ': ' + (j?.error || txt.slice(0, 120)));
+      err.status = r.status;
+      throw err;
+    }
+    return j;
+  }
+
+  // ---- 上传进度条（自绘，Shadow DOM）----
+  // 渲染器原生的「正在上传 x%」UI 只在远程工作区分支（transferService.stage）激活，
+  // 拖拽乐观路径走 localZeroCopy 分支永远不显示进度 → 自己画一枚右下角浮动条。
+  const UploadUI = (function () {
+    let host = null, sr = null, list = null;
+    const items = new Map();   // token -> { row, bar, pct, label }
+    function ensure() {
+      if (host || !document.body) return !!host;
+      host = document.createElement('div');
+      host.id = 'zcode-upload-indicator';
+      host.style.cssText = 'position:fixed;right:18px;bottom:18px;z-index:2147483646;pointer-events:none;';
+      sr = host.attachShadow({ mode: 'open' });
+      sr.innerHTML = `
+        <style>
+          * { box-sizing: border-box; font-family: var(--font-sans, ui-sans-serif, system-ui, sans-serif); }
+          .list { display: flex; flex-direction: column; gap: 8px; }
+          .item {
+            width: 260px; padding: 8px 12px 10px; border-radius: 10px;
+            color: var(--color-foreground, #e7e7e7);
+            background: color-mix(in oklab, var(--color-card, #2b2b2b) 96%, transparent);
+            border: 1px solid var(--color-border, rgba(255,255,255,.12));
+            box-shadow: 0 12px 32px -12px rgba(0,0,0,.6);
+            backdrop-filter: blur(12px);
+            font-size: 12px; line-height: 1.4;
+            animation: slide-in .25s cubic-bezier(.22,1,.36,1);
+          }
+          .item[data-state="done"] { animation: fade-out 1.6s ease 1.1s forwards; }
+          .item[data-state="error"] { border-color: rgba(255,92,92,.55); }
+          @keyframes slide-in { from { opacity: 0; transform: translateY(10px); } }
+          @keyframes fade-out { to { opacity: 0; transform: translateY(6px); } }
+          .row1 { display: flex; align-items: center; gap: 6px; }
+          .name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+          .state { font-size: 11px; color: var(--color-foreground-subtlest, rgba(231,231,231,.55)); font-variant-numeric: tabular-nums; }
+          .state.ok { color: #2ecc8f; }
+          .state.err { color: #ff5c5c; }
+          .state.info { color: #57a9ff; }
+          .track { margin-top: 6px; height: 3px; border-radius: 99px;
+            background: color-mix(in oklab, var(--color-foreground, #fff) 12%, transparent); overflow: hidden; }
+          .fill { height: 100%; width: 0%; border-radius: inherit;
+            background: #57a9ff; transition: width .18s ease; }
+          .item[data-state="done"] .fill { background: #2ecc8f; width: 100%; }
+          .item[data-state="error"] .fill { background: #ff5c5c; }
+        </style>
+        <div class="list"></div>`;
+      list = sr.querySelector('.list');
+      document.body.appendChild(host);
+      return true;
+    }
+    function whenReady(fn) { if (ensure()) fn(); else document.addEventListener('DOMContentLoaded', () => { ensure(); fn(); }, { once: true }); }
+    function fmt(b) { return b >= 1048576 ? (b / 1048576).toFixed(1) + ' MB' : Math.max(1, Math.round(b / 1024)) + ' KB'; }
+    return {
+      begin(token, name, total) {
+        whenReady(() => {
+          if (items.has(token)) return;
+          const item = document.createElement('div');
+          item.className = 'item';
+          item.dataset.state = 'uploading';
+          item.innerHTML = `<div class="row1"><span class="name"></span><span class="state"></span></div><div class="track"><div class="fill"></div></div>`;
+          item.querySelector('.name').textContent = name;
+          item.querySelector('.state').textContent = total ? fmt(total) : '';
+          list.appendChild(item);
+          items.set(token, { row: item, bar: item.querySelector('.fill'), pct: 0, total: total || 0 });
+        });
+      },
+      progress(token, loaded, total) {
+        whenReady(() => {
+          const it = items.get(token);
+          if (!it) return;
+          const pct = total ? Math.min(100, Math.floor((loaded / total) * 100)) : it.pct;
+          it.pct = pct;
+          it.bar.style.width = pct + '%';
+          it.row.querySelector('.state').textContent = pct + '% · ' + fmt(Math.max(loaded, 0));
+        });
+      },
+      /** 本地哈希计算阶段（dedupe 前置）：显示「校验中 xx%」。 */
+      hashProgress(token, loaded, total) {
+        whenReady(() => {
+          const it = items.get(token);
+          if (!it) return;
+          const pct = total ? Math.min(100, Math.floor((loaded / total) * 100)) : 0;
+          it.bar.style.width = pct + '%';
+          const st = it.row.querySelector('.state');
+          st.textContent = '校验 ' + pct + '%';
+          st.className = 'state info';
+        });
+      },
+      /** 秒传命中：条子直接拉满并显示「已存在，秒传」。 */
+      deduped(token) {
+        whenReady(() => {
+          const it = items.get(token);
+          if (!it) return;
+          it.row.dataset.state = 'done';
+          it.bar.style.width = '100%';
+          const st = it.row.querySelector('.state');
+          st.textContent = '服务器已有 · 秒传';
+          st.className = 'state ok';
+          items.delete(token);
+          setTimeout(() => it.row.remove(), 2800);
+        });
+      },
+      done(token, name) {
+        whenReady(() => {
+          const it = items.get(token);
+          if (!it) return;
+          it.row.dataset.state = 'done';
+          it.row.querySelector('.state').textContent = '已上传';
+          it.row.querySelector('.state').className = 'state ok';
+          items.delete(token);
+          setTimeout(() => it.row.remove(), 2800);
+        });
+      },
+      error(token, msg) {
+        whenReady(() => {
+          const it = items.get(token);
+          if (!it) { return; }
+          it.row.dataset.state = 'error';
+          const st = it.row.querySelector('.state');
+          st.textContent = '失败: ' + String(msg || '').slice(0, 40);
+          st.className = 'state err';
+          items.delete(token);
+          setTimeout(() => it.row.remove(), 6000);
+        });
+      },
+    };
+  })();
+
+  /** XHR 上传（fetch 拿不到上传进度）；onProgress(loaded,total)。resolve JSON。 */
+  function xhrUpload(url, file, onProgress) {
+    return new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open('POST', url, true);
+      xhr.setRequestHeader('content-type', 'application/octet-stream');
+      // 停滞上传不要挂到 TCP 超时为止：15min 下限速率 ≈ 570KB/s（512MB 慢链路），
+      // 低于此速度按失败处理，由 UploadUI.error 呈现并触发 /upload-failed。
+      xhr.timeout = 15 * 60 * 1000;
+      if (onProgress) {
+        xhr.upload.onprogress = (e) => { try { onProgress(e.loaded, e.total || 0); } catch {} };
+      }
+      xhr.onload = () => {
+        let j = null;
+        try { j = JSON.parse(xhr.responseText); } catch {}
+        if (xhr.status >= 200 && xhr.status < 300 && j && j.ok !== false) resolve(j);
+        else reject(Object.assign(new Error('web-bridge ' + xhr.status + ': ' + (j?.error || xhr.responseText.slice(0, 100))), { status: xhr.status }));
+      };
+      xhr.onerror = () => reject(new Error('network_error'));
+      xhr.ontimeout = () => reject(new Error('timeout'));
+      try { xhr.send(file); } catch (e) { reject(e); }
+    });
+  }
+
+  function uploadUrl(token, name, size, file, sha256) {
+    return '/upload?token=' + encodeURIComponent(token) +
+      '&name=' + encodeURIComponent(name) + '&size=' + size +
+      (file && file.type ? '&mime=' + encodeURIComponent(file.type) : '') +
+      (sha256 ? '&sha256=' + encodeURIComponent(sha256) : '');
+  }
+
+  // ---- 纯 JS SHA-256 ----
+  // 为什么不用 crypto.subtle.digest：它只在安全上下文（HTTPS/localhost）存在；本服务
+  // 常以 http://IP:8080 裸跑，subtle undefined。内置实现 ~60 行，对 ≤512MB 的上传
+  // 分块流式计算（File.slice 避免整文件进内存）。
+  // 大文件的压缩循环是同步计算：主线程按 4MB 块跑会连续抢占 UI（每块几十 ms），
+  // 512MB 级上传整个哈希期界面都会发卡 → 优先丢进 Web Worker（Blob 克隆是引用
+  // 语义，不拷字节），Worker 不可用/出错时回退主线程实现。
+  // 注意：sha256WorkerMain 经 toString() 序列化为 worker 源，必须保持**零闭包引用**；
+  // 算法与下方主线程兜底实现保持同步（同 test-codec.cjs 的双实现约定）。
+  function sha256WorkerMain() {
+    const K = new Uint32Array([
+      0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
+      0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
+      0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
+      0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
+      0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
+      0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
+      0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
+      0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2,
+    ]);
+    function rotr(x, n) { return (x >>> n) | (x << (32 - n)); }
+    function process(H, data) {
+      for (let off = 0; off < data.length; off += 64) {
+        const chunk = data.subarray(off, off + 64);
+        const w = new Uint32Array(64);
+        for (let i = 0; i < 16; i++) w[i] = (chunk[i * 4] << 24) | (chunk[i * 4 + 1] << 16) | (chunk[i * 4 + 2] << 8) | chunk[i * 4 + 3];
+        for (let i = 16; i < 64; i++) {
+          const s0 = rotr(w[i - 15], 7) ^ rotr(w[i - 15], 18) ^ (w[i - 15] >>> 3);
+          const s1 = rotr(w[i - 2], 17) ^ rotr(w[i - 2], 19) ^ (w[i - 2] >>> 10);
+          w[i] = (w[i - 16] + s0 + w[i - 7] + s1) >>> 0;
+        }
+        let [a, b, c, d, e, f, g, h] = H;
+        for (let i = 0; i < 64; i++) {
+          const S1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);
+          const ch = (e & f) ^ (~e & g);
+          const t1 = (h + S1 + ch + K[i] + w[i]) >>> 0;
+          const S0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22);
+          const mj = (a & b) ^ (a & c) ^ (b & c);
+          const t2 = (S0 + mj) >>> 0;
+          h = g; g = f; f = e; e = (d + t1) >>> 0; d = c; c = b; b = a; a = (t1 + t2) >>> 0;
+        }
+        H[0] = (H[0] + a) >>> 0; H[1] = (H[1] + b) >>> 0; H[2] = (H[2] + c) >>> 0; H[3] = (H[3] + d) >>> 0;
+        H[4] = (H[4] + e) >>> 0; H[5] = (H[5] + f) >>> 0; H[6] = (H[6] + g) >>> 0; H[7] = (H[7] + h) >>> 0;
+      }
+    }
+    async function ofBlob(blob, progress) {
+      const H = new Uint32Array([0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19]);
+      const CHUNK = 4 * 1024 * 1024;
+      const total = blob.size;
+      let offset = 0;
+      let pending = new Uint8Array(0);
+      while (offset < total) {
+        const buf = new Uint8Array(await blob.slice(offset, offset + CHUNK).arrayBuffer());
+        offset += buf.length;
+        const data = pending.length ? concat(pending, buf) : buf;
+        const full = data.length - (data.length % 64);
+        if (full > 0) process(H, data.subarray(0, full));
+        pending = data.subarray(full);
+        if (progress) { try { progress(offset, total); } catch {} }
+      }
+      const rem = pending.length;
+      const tailLen = rem + 1 + 8 <= 64 ? 64 : 128;
+      const tail = new Uint8Array(tailLen);
+      tail.set(pending, 0);
+      tail[rem] = 0x80;
+      const dv = new DataView(tail.buffer);
+      dv.setUint32(tailLen - 8, Math.floor(total / 0x20000000));
+      dv.setUint32(tailLen - 4, (total * 8) >>> 0);
+      for (let i = 0; i < tailLen; i += 64) process(H, tail.subarray(i, i + 64));
+      let hex = '';
+      for (let i = 0; i < 8; i++) hex += H[i].toString(16).padStart(8, '0');
+      return hex;
+    }
+    function concat(a, b) {
+      const r = new Uint8Array(a.length + b.length);
+      r.set(a, 0); r.set(b, a.length);
+      return r;
+    }
+    self.onmessage = async (ev) => {
+      const d = ev.data || {};
+      try {
+        const hex = await ofBlob(d.blob, (l, t) => { try { self.postMessage({ id: d.id, loaded: l, total: t }); } catch {} });
+        self.postMessage({ id: d.id, hex });
+      } catch (e) { self.postMessage({ id: d.id, error: String((e && e.message) || e) }); }
+    };
+  }
+
+  const Sha256 = (function () {
+    let worker = null, workerBroken = false, nextMsgId = 0;
+    const cbs = new Map();   // msgId -> { resolve, reject, progress }
+
+    function ensureWorker() {
+      if (workerBroken || typeof Worker === 'undefined' || typeof Blob === 'undefined') return null;
+      if (worker) return worker;
+      try {
+        const url = URL.createObjectURL(new Blob(['(' + sha256WorkerMain.toString() + ')();'], { type: 'text/javascript' }));
+        worker = new Worker(url);
+        worker.onmessage = (ev) => {
+          const d = ev.data || {};
+          const cb = cbs.get(d.id);
+          if (!cb) return;
+          if (d.error) { cbs.delete(d.id); cb.reject(new Error('sha256_worker: ' + d.error)); }
+          else if (d.hex !== undefined) { cbs.delete(d.id); cb.resolve(d.hex); }
+          else if (d.loaded !== undefined) { try { cb.progress(d.loaded, d.total); } catch {} }
+        };
+        worker.onerror = () => {
+          // 脚本级失败（如 CSP 拦截 blob worker）：标记永久降级，在途任务回退主线程
+          workerBroken = true;
+          for (const [, cb] of cbs) cb.reject(new Error('sha256_worker_error'));
+          cbs.clear();
+          try { worker.terminate(); } catch {}
+          worker = null;
+        };
+      } catch (e) {
+        workerBroken = true;
+        beacon('warn', 'SHA-256 Worker 创建失败，回退主线程: ' + e.message);
+        return null;
+      }
+      return worker;
+    }
+
+    function hashViaWorker(blob, progress) {
+      const w = ensureWorker();
+      if (!w) return null;
+      return new Promise((resolve, reject) => {
+        const id = ++nextMsgId;
+        cbs.set(id, { resolve, reject, progress: progress || (() => {}) });
+        try { w.postMessage({ id, blob }); } catch (e) { cbs.delete(id); reject(e); }
+      });
+    }
+
+    // ---- 主线程兜底实现（算法与 sha256WorkerMain 保持同步）----
+    function rotr(x, n) { return (x >>> n) | (x << (32 - n)); }
+    const K = new Uint32Array([
+      0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
+      0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
+      0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
+      0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
+      0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
+      0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
+      0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
+      0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2,
+    ]);
+    /** 压缩函数：一次处理 64 字节整块。data 是 64 倍数长度的视图。 */
+    function process(H, data) {
+      for (let off = 0; off < data.length; off += 64) {
+        const chunk = data.subarray(off, off + 64);
+        const w = new Uint32Array(64);
+        for (let i = 0; i < 16; i++) w[i] = (chunk[i * 4] << 24) | (chunk[i * 4 + 1] << 16) | (chunk[i * 4 + 2] << 8) | chunk[i * 4 + 3];
+        for (let i = 16; i < 64; i++) {
+          const s0 = rotr(w[i - 15], 7) ^ rotr(w[i - 15], 18) ^ (w[i - 15] >>> 3);
+          const s1 = rotr(w[i - 2], 17) ^ rotr(w[i - 2], 19) ^ (w[i - 2] >>> 10);
+          w[i] = (w[i - 16] + s0 + w[i - 7] + s1) >>> 0;
+        }
+        let [a, b, c, d, e, f, g, h] = H;
+        for (let i = 0; i < 64; i++) {
+          const S1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);
+          const ch = (e & f) ^ (~e & g);
+          const t1 = (h + S1 + ch + K[i] + w[i]) >>> 0;
+          const S0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22);
+          const mj = (a & b) ^ (a & c) ^ (b & c);
+          const t2 = (S0 + mj) >>> 0;
+          h = g; g = f; f = e; e = (d + t1) >>> 0; d = c; c = b; b = a; a = (t1 + t2) >>> 0;
+        }
+        H[0] = (H[0] + a) >>> 0; H[1] = (H[1] + b) >>> 0; H[2] = (H[2] + c) >>> 0; H[3] = (H[3] + d) >>> 0;
+        H[4] = (H[4] + e) >>> 0; H[5] = (H[5] + f) >>> 0; H[6] = (H[6] + g) >>> 0; H[7] = (H[7] + h) >>> 0;
+      }
+    }
+    /** 流式 SHA-256：progress(loaded,total) 可选。分块读 File（不整进内存）。 */
+    async function ofBlobMainThread(blob, progress) {
+      const H = new Uint32Array([0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19]);
+      const CHUNK = 4 * 1024 * 1024;
+      const total = blob.size;
+      let offset = 0;
+      let pending = new Uint8Array(0);   // 尾部不足 64 字节的余量
+      while (offset < total) {
+        const buf = new Uint8Array(await blob.slice(offset, offset + CHUNK).arrayBuffer());
+        offset += buf.length;
+        const data = pending.length ? concat(pending, buf) : buf;
+        const full = data.length - (data.length % 64);
+        if (full > 0) process(H, data.subarray(0, full));
+        pending = data.subarray(full);   // 0..63 字节视图
+        if (progress) { try { progress(offset, total); } catch {} }
+      }
+      // 标准填充：0x80 + 0 填充 + 8 字节大端位长，补齐到 64 的倍数（1 或 2 块）
+      const rem = pending.length;
+      const tailLen = rem + 1 + 8 <= 64 ? 64 : 128;
+      const tail = new Uint8Array(tailLen);
+      tail.set(pending, 0);
+      tail[rem] = 0x80;
+      const dv = new DataView(tail.buffer);
+      dv.setUint32(tailLen - 8, Math.floor(total / 0x20000000)); // 高 32 位（字节→位）
+      dv.setUint32(tailLen - 4, (total * 8) >>> 0);              // 低 32 位
+      for (let i = 0; i < tailLen; i += 64) process(H, tail.subarray(i, i + 64));
+      let hex = '';
+      for (let i = 0; i < 8; i++) hex += H[i].toString(16).padStart(8, '0');
+      return hex;
+    }
+    function concat(a, b) {
+      const r = new Uint8Array(a.length + b.length);
+      r.set(a, 0); r.set(b, a.length);
+      return r;
+    }
+
+    return {
+      async ofBlob(blob, progress) {
+        try {
+          const viaWorker = hashViaWorker(blob, progress);
+          if (viaWorker) return await viaWorker;
+        } catch (e) { beacon('warn', 'SHA-256 Worker 计算失败，回退主线程: ' + (e && e.message)); }
+        return ofBlobMainThread(blob, progress);
+      },
+    };
+  })();
+
+  // 已成功前置注册的 clientToken（getPathForFile 的 fire-and-forget register 完成时登记）。
+  // uploadFileSmart 据此跳过一次注定 400 token_taken 的重复注册 —— 拖拽路径原本每次
+  // 都要白付这个往返。只在注册真正成功后登记：失败/竞态时 uploadFileSmart 照常重注册。
+  const preRegistered = new Set();
+
+  /** 上传一个 File 到服务器（内容寻址去重）。
+   *  流程：算 SHA-256 → POST /upload-dedupe 查询 → 命中=秒传（零字节）；未命中=XHR 传字节。
+   *  clientToken：乐观路径（getPathForFile 拖拽）传客户端已生成的 token —— dedupe 命中时
+   *  服务端按它结算，落盘路径与垫片同步返回的预测路径一致。
+   *  返回 Promise<{ path, token, deduped, sha256 }>；onProgress 汇报阶段：
+   *  'hash'（本地计算）/ 'dedupe'（秒传命中）/ 'register' / 'upload'（网络传输）。 */
+  async function uploadFileSmart(file, onProgress, clientToken) {
+    const name = file.name || 'file';
+    // 1. 本地算哈希（进度条先走 hash 阶段）
+    let sha = null;
+    try { sha = await Sha256.ofBlob(file, (l, t) => onProgress?.('hash', l, t)); }
+    catch (e) { beacon('error', 'SHA-256 计算失败（退回直传）: ' + e.message); }
+    // 2. dedupe 查询（sha 可能为 null —— 跳过，直接上传）
+    if (sha) {
+      try {
+        const tok = clientToken || (Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 10));
+        const d = await httpJson('/upload-dedupe?token=' + encodeURIComponent(tok) +
+          '&sha256=' + sha + '&size=' + file.size +
+          (file.type ? '&mime=' + encodeURIComponent(file.type) : '') +
+          '&name=' + encodeURIComponent(name), { method: 'POST' });
+        if (d.ok && d.deduped) {
+          onProgress?.('dedupe', file.size, file.size);
+          return { path: d.path, token: tok, deduped: true, sha256: sha };
+        }
+      } catch (e) { beacon('error', 'dedupe 查询失败（退回直传）: ' + e.message); }
+    }
+    // 3. 注册（带 size → 服务端立即写占位）+ XHR 上传（带 sha256 校验 + 内容寻址落盘）
+    //    getPathForFile 已抢先发过同 token 注册（占位已写）—— 前置注册成功时直接
+    //    复用；否则幂等重注册（token_taken = 前置注册已成功 → 也复用）。
+    let reg = null;
+    if (!clientToken) {
+      // {method:'POST'} 不能省：httpJson 缺省会发 GET，而 /upload-register 路由只认
+      // POST —— GET 会落进 SPA 静态兜底返回 index.html（曾导致所有直传必失败）。
+      reg = await httpJson('/upload-register?name=' + encodeURIComponent(name) + '&size=' + file.size, { method: 'POST' });
+    } else if (preRegistered.has(clientToken)) {
+      reg = { token: clientToken };
+    } else {
+      reg = await httpJson('/upload-register?name=' + encodeURIComponent(name) +
+        '&size=' + file.size + '&token=' + encodeURIComponent(clientToken), { method: 'POST' })
+        .then((r) => { preRegistered.add(clientToken); return r; })
+        .catch((e) => {
+          // token_taken = 前置注册已成功 → 直接复用
+          if (e.status === 400) { preRegistered.add(clientToken); return { token: clientToken }; }
+          throw e;
+        });
+    }
+    onProgress?.('register', 0, file.size);
+    const r = await xhrUpload(uploadUrl(reg.token, name, file.size, file, sha), file,
+      (l, t) => onProgress?.('upload', l, t));
+    return { path: r.path, token: reg.token, deduped: false, sha256: sha };
+  }
+
+  /** 把一个 File/Blob 上传到服务器 .uploads/；返回 { path, token }（await 完成态）。 */
+  async function uploadFileToServer(file) {
+    const name = file.name || 'file';
+    const uiTok = 'sel-' + Math.random().toString(36).slice(2, 8);
+    UploadUI.begin(uiTok, name, file.size);
+    try {
+      const r = await uploadFileSmart(file, (phase, l, t) => {
+        if (phase === 'hash') UploadUI.hashProgress(uiTok, l, t);
+        else if (phase === 'dedupe') UploadUI.deduped(uiTok);
+        else UploadUI.progress(uiTok, l, t);
+      });
+      UploadUI.done(uiTok, name);
+      return { path: r.path, token: r.token };
+    } catch (e) {
+      UploadUI.error(uiTok, e.message);
+      throw e;
+    }
+  }
+
+  // getPathForFile：渲染器同步调用（map 里无 await）→ 乐观路径。
+  // 同步返回预测落盘路径 <ws>/.uploads/<token>__<safeName>（双方约定的确定性命名），
+  // 并立刻 fire-and-forget 注册（带 size → 服务端马上写占位文本），字节/秒传由
+  // uploadFileSmart 后台处理。用户在任意时刻点发送都有完备语义：
+  //  - 上传已完成 → 闸门直接放行真实路径；
+  //  - 8s 宽限内完成 → 闸门等到落地再放行（小文件无感）；
+  //  - 大文件未完 → 闸门放行占位路径，模型读占位文本里的阻塞等待命令自己等。
+  zcode.getPathForFile = function (file) {
+    try {
+      const name = (file && file.name) || 'file';
+      const size = (file && file.size) || 0;
+      const token = Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 10);
+      const safeName = String(name).replace(/[\u0000-\u001f\u007f"\\/:*?<>|]/g, '_').trim().slice(0, 128) || 'file';
+      const predicted = __ws + '/.uploads/' + token + '__' + safeName;
+      UploadUI.begin(token, name, size);
+      // 立刻注册 + 占位（fetch 不阻塞返回值；uploadFileSmart 里会幂等重注册）。
+      // 成功后登记 preRegistered，uploadFileSmart 跳过重复注册。
+      fetch('/upload-register?name=' + encodeURIComponent(name) +
+        '&size=' + size + '&token=' + encodeURIComponent(token), { method: 'POST' })
+        .then((r) => { if (r.ok) preRegistered.add(token); })
+        .catch(() => {});
+      uploadFileSmart(file, (phase, l, t) => {
+        if (phase === 'hash') UploadUI.hashProgress(token, l, t);
+        else if (phase === 'dedupe') UploadUI.deduped(token);
+        else UploadUI.progress(token, l, t);
+      }, token)
+        .then((r) => { if (!r.deduped) UploadUI.done(token, name); })
+        .catch((e) => {
+          beacon('error', '拖拽附件上传失败 ' + name + ': ' + e.message);
+          UploadUI.error(token, e.message);
+          // 告诉服务端把占位改写成失败说明（模型若在阻塞等待会因大小变化退出）
+          fetch('/upload-failed?token=' + encodeURIComponent(token), { method: 'POST' }).catch(() => {});
+        });
+      return predicted;
+    } catch (e) {
+      beacon('error', 'getPathForFile 失败: ' + e.message);
+      return null;
+    }
+  };
+
+  // selectFile / selectFiles：回形针入口。弹原生文件选择器，上传后返回**服务器路径**数组。
+  function pickFiles(multiple) {
+    return new Promise((resolve) => {
+      const input = document.createElement('input');
+      input.type = 'file';
+      if (multiple) input.multiple = true;
+      input.style.display = 'none';
+      document.body.appendChild(input);
+      let settled = false;
+      const finish = (paths) => { if (!settled) { settled = true; input.remove(); resolve(paths); } };
+      input.addEventListener('change', async () => {
+        const files = Array.from(input.files || []);
+        if (!files.length) return finish(null);
+        const paths = [];
+        for (const f of files) {
+          try {
+            const r = await uploadFileToServer(f);
+            paths.push(r.path);
+            beacon('upload', '已上传 ' + f.name + ' → ' + r.path);
+          } catch (e) {
+            beacon('error', '选择文件上传失败 ' + f.name + ': ' + e.message);
+          }
+        }
+        finish(paths.length ? paths : null);
+      });
+      // cancel 事件：用户关掉选择器 → null（= 用户取消，渲染器静默处理）
+      window.addEventListener('focus', () => {
+        setTimeout(() => { if (!settled && !(input.files && input.files.length)) { /* 可能仍在选 */ } }, 1000);
+      }, { once: true });
+      input.click();
+    });
+  }
+  zcode.selectFile = () => pickFiles(false).then((r) => (r && r[0]) || null);
+  zcode.selectFiles = () => pickFiles(true).then((r) => r || []);
+
+  // createTempTextAttachment：粘贴长文本 → 服务器临时文件（渲染器随后零拷贝引用它）
+  zcode.createTempTextAttachment = async ({ text, filename }) => {
+    try {
+      const r = await httpJson('/upload-text', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ text: String(text || ''), filename: filename || undefined }),
+      });
+      return r.path;
+    } catch (e) {
+      beacon('error', '文本附件上传失败: ' + e.message);
+      return null;
+    }
+  };
+
+  // openInFileManager / openInEditor：原生「打开文件」手势 → 浏览器下载。
+  function triggerDownload(p) {
+    try {
+      const a = document.createElement('a');
+      a.href = '/download?path=' + encodeURIComponent(p);
+      a.download = '';
+      a.style.display = 'none';
+      document.body.appendChild(a);
+      a.click();
+      setTimeout(() => a.remove(), 5000);
+      beacon('download', '触发下载: ' + p);
+    } catch (e) {
+      beacon('error', '触发下载失败: ' + e.message);
+    }
+  }
+  // pathKind 判定与渲染器一致（file → 下载; directory → 不支持）
+  zcode.openInFileManager = async (p) => {
+    if (!p) return UNSUPPORTED;
+    triggerDownload(p);
+    return { success: true };
+  };
+  zcode.openInEditor = async (_editorId, p, opts) => {
+    if (!p) return UNSUPPORTED;
+    if (opts && opts.pathKind === 'directory') return UNSUPPORTED;
+    triggerDownload(p);
+    return { success: true };
+  };
 
   // 说明：以下 66 个桌面专属 API **故意不定义**，渲染器特性检测后会自动禁用相关 UI：
   //   窗口外观(getDesktopWindowChromeState/getWindowControlsOverlayMetrics/getDesktopZoomLevel)、

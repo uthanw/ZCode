@@ -1428,29 +1428,9 @@ function stubService(name, methods) {
   return svc;
 }
 
-function buildAllChannels({ appServer, workspaceRoot, logger, configPath }) {
+function buildAllChannels({ appServer, workspaceRoot, logger, configPath, uploadRegistry }) {
   const defaultWorkspace = { workspacePath: workspaceRoot, workspaceKey: workspaceRoot };
   const normWorkspace = (p) => (p?.workspacePath ? { workspacePath: p.workspacePath, workspaceKey: p.workspacePath, ...(p.workspaceIdentity ? { workspaceIdentity: p.workspaceIdentity } : {}) } : defaultWorkspace);
-  // [诊断] 方法调用计数 — 每 60s dump 一次 top 调用 (查 icon 闪烁根因, 定位后移除)
-  const callCounts = new Map();
-  setInterval(() => {
-    if (callCounts.size === 0) return;
-    const top = [...callCounts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 12);
-    if (top[0][1] >= 3) logger?.info?.('[diag-calls] ' + top.map(([k, v]) => `${k}=${v}`).join(' '));
-    callCounts.clear();
-  }, 15000).unref?.();
-  const wrapChannel = (name, svc) => {
-    for (const k of Object.keys(svc)) {
-      if (typeof svc[k] !== 'function') continue;
-      const orig = svc[k];
-      svc[k] = function (...args) {
-        const key = `${name}.${k}`;
-        callCounts.set(key, (callCounts.get(key) || 0) + 1);
-        return orig.apply(this, args);
-      };
-    }
-    return svc;
-  };
   const services = {
     [CHANNELS.File]: fileService({ logger, workspaceRoot }),
     [CHANNELS.System]: systemService(),
@@ -1757,14 +1737,9 @@ function buildAllChannels({ appServer, workspaceRoot, logger, configPath }) {
   Object.assign(services, {
     [CHANNELS.ZCodeSession]: buildZodeSessionService({ appServer, defaultWorkspace, logger, hub: sharedHub }),
     [CHANNELS.ZCodeTask]: buildZCodeTaskService({ appServer, defaultWorkspace, logger, services, hub: sharedHub }),
-    [CHANNELS.ZCodeAgent]: buildZCodeAgentService({ appServer, defaultWorkspace: defaultWorkspace.workspacePath, logger, services, hub: sharedHub }),
+    [CHANNELS.ZCodeAgent]: buildZCodeAgentService({ appServer, defaultWorkspace: defaultWorkspace.workspacePath, logger, services, hub: sharedHub, uploadRegistry }),
   });
   services[CHANNELS.WindowController] = windowControllerService({ appServer, defaultWorkspace, logger, hub: sharedHub, services });
-
-  // [诊断] 包装全部 channel 方法计数
-  for (const [name, svc] of Object.entries(services)) {
-    if (svc && typeof svc === 'object') wrapChannel(name, svc);
-  }
 
   return services;
 }

@@ -28,6 +28,7 @@ const { Emitter, VSBuffer, ChannelServer, MessagePortProtocol, WebSocketMessageP
 const { ResumableSession } = require('./lib/resumable.js');
 const { AppServerClient } = require('./lib/zcode-app-server.js');
 const { CHANNELS, buildAllChannels } = require('./services/index.js');
+const { UploadRegistry, REGISTRY_PREFIX, safeBaseName } = require('./lib/upload-registry.js');
 
 const logger = (() => {
   const ts = () => new Date().toLocaleTimeString('zh-CN', { hour12: false });
@@ -38,6 +39,17 @@ const logger = (() => {
     debug: (...a) => { if (process.env.ZCODE_WEB_DEBUG) console.log(`[web:debug ${ts()}]`, ...a); },
   };
 })();
+
+// ---------- Web 端文件上传/下载 ----------
+// 详见 lib/upload-registry.js 顶部说明。上传落盘到 WORKSPACE_ROOT/.uploads/（点开头目录，
+// 渲染器文件树默认不显示），下载复用同一套 token 鉴权（cookie / Bearer / ?token=）。
+const uploadRegistry = new UploadRegistry({
+  workspaceRoot: WORKSPACE_ROOT,
+  maxUploadBytes: Number(process.env.ZCODE_WEB_UPLOAD_MAX_BYTES || 512 * 1024 * 1024),
+  logger,
+});
+uploadRegistry.start();
+logger.info(`上传注册表就绪 (.uploads, 单文件上限 ${(uploadRegistry.maxUploadBytes / 1048576) | 0}MB)`);
 
 // ---------- MIME ----------
 const MIME = {
@@ -169,7 +181,10 @@ async function sendFile(req, res, target, st) {
 async function serveHtml(req, res) {
   let html = await fsp.readFile(path.join(RENDERER_DIR, 'index.html'), 'utf8');
   const shim = await getShim();
-  html = html.replace('<script type="module"', `<script>${shim}</script>\n    <script type="module"`);
+  // 把服务器真实 WORKSPACE_ROOT 交给 shim（乐观路径的确定性落盘路径预测要用）：
+  // 单独注入一枚配置脚本，shim 文件本身保持静态（不内嵌机器路径、无占位符）。
+  html = html.replace('<script type="module"',
+    `<script>window.__ZCODE_WEB_WORKSPACE__ = ${JSON.stringify(WORKSPACE_ROOT)};</script>\n    <script>${shim}</script>\n    <script type="module"`);
   const body = Buffer.from(html, 'utf8');
   const headers = { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store', vary: 'Accept-Encoding' };
   const enc = pickEncoding(req);
@@ -343,6 +358,158 @@ const server = http.createServer(async (req, res) => {
     });
     return;
   }
+  // ---------- Web 端文件上传（乐观路径的落地端点）----------
+  // POST /upload-register?name=<fileName>[&token=<clientToken>][&size=<bytes>]
+  //   前置注册。size 带上时服务端立刻在预测路径写占位文本（文件上传中+阻塞等待
+  //   命令），保证拖拽瞬间起到落地为止该路径始终有语义。token 幂等：已注册返回
+  //   400 token_taken（垫片视为成功复用）。
+  if (req.method === 'POST' && urlPath0 === '/upload-register') {
+    const q = new URL(req.url, 'http://x').searchParams;
+    req.resume();
+    const sizeRaw = Number(q.get('size'));
+    const r = await uploadRegistry.registerEndpoint(
+      q.get('name') || 'file',
+      q.get('token') || undefined,
+      Number.isFinite(sizeRaw) && sizeRaw >= 0 ? sizeRaw : undefined,
+    );
+    res.writeHead(r.ok ? 200 : (r.error === 'bad_token' || r.error === 'token_taken' ? 400 : 500), { 'content-type': 'application/json' });
+    res.end(JSON.stringify(r));
+    return;
+  }
+
+  // POST /upload-failed?token=<token> —— 垫片上传失败回调：把占位改写成失败说明
+  //   （模型若正阻塞等待会因文件大小变化退出循环并告知用户）。
+  if (req.method === 'POST' && urlPath0 === '/upload-failed') {
+    const q = new URL(req.url, 'http://x').searchParams;
+    req.resume();
+    const token = q.get('token') || '';
+    const entry = uploadRegistry.entries.get(token);
+    if (entry && !entry.settled) {
+      await uploadRegistry.writeFailure(entry, q.get('reason') || 'client_reported_failure').catch(() => {});
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ ok: true }));
+    } else if (entry && entry.settled) {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ ok: true, note: 'already_settled' }));
+    } else {
+      res.writeHead(404, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: 'unknown_token' }));
+    }
+    return;
+  }
+
+  // POST /upload-dedupe?token=<token>&sha256=<hex>&size=<bytes>[&mime=][&name=]
+  //   内容寻址秒传：该哈希的 blob 已在服务器 → 硬链接结算 token，零字节传输。
+  //   返回 {ok,deduped:true}；未命中 → {miss:true}，客户端走正常 /upload。
+  if (req.method === 'POST' && urlPath0 === '/upload-dedupe') {
+    const q = new URL(req.url, 'http://x').searchParams;
+    const r = await uploadRegistry.dedupeCheck(q.get('token') || '', {
+      sha256: q.get('sha256') || '',
+      bytes: Number(q.get('size') || '0'),
+      mime: q.get('mime') || '',
+      fileName: q.get('name') || 'file',
+    }, req.socket.remoteAddress);
+    // 消化可能的空 body
+    req.resume();
+    if (r && r.ok) {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify(r));
+    } else if (r && r.error) {
+      res.writeHead(400, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: r.error }));
+    } else {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ miss: true }));
+    }
+    return;
+  }
+
+  // POST /upload?token=<registryToken>&name=<fileName>&size=<bytes>[&mime=][&sha256=]
+  //   body = 原始字节。token 由 shim 在 getPathForFile 里注册（register()），
+  //   服务端边写边算 SHA-256 → 落 blob + 硬链接别名 .uploads/<token>__<safeName>。
+  //   带 sha256 时强校验（防谎报哈希骗秒传）。
+  if (req.method === 'POST' && urlPath0 === '/upload') {
+    const q = new URL(req.url, 'http://x').searchParams;
+    const token = q.get('token') || '';
+    const name = q.get('name') || 'file';
+    const size = Number(q.get('size') || '0');
+    const mime = q.get('mime') || '';
+    const sha256 = q.get('sha256') || '';
+    if (!uploadRegistry.entries.has(token)) {
+      // 注册纪律收紧：/upload 必须先经 /upload-register 登记（两条客户端路径——
+      // 拖拽乐观路径与 selectFiles——都在上传前 await/预注册过）。匿名写入会绕过
+      // 占位与 TTL 生命周期，这里直接拒。
+      res.writeHead(404, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: 'unknown_token' }));
+      return;
+    }
+    const r = await uploadRegistry.settle(token, { stream: req, bytes: size, mime, fileName: name, sha256 }, req.socket.remoteAddress);
+    if (r.ok) {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ ok: true, path: r.path, bytes: r.bytes, sha256: r.sha256 }));
+    } else if (r.error === 'too_large') {
+      res.writeHead(413, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: 'too_large', maxBytes: uploadRegistry.maxUploadBytes }));
+    } else if (r.error === 'sha_mismatch' || r.error === 'bad_sha256') {
+      res.writeHead(400, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: r.error }));
+    } else {
+      res.writeHead(500, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: r.error || 'write_failed' }));
+    }
+    return;
+  }
+
+  // POST /upload-text —— createTempTextAttachment 的落地面（粘贴长文本 → 临时文件）。
+  // 直接落盘并返回路径，不走注册表（调用方本来就 await）。
+  if (req.method === 'POST' && urlPath0 === '/upload-text') {
+    let body = Buffer.alloc(0);
+    for await (const c of req) {
+      body = Buffer.concat([body, c]);
+      if (body.length > 4 * 1024 * 1024) { res.writeHead(413); res.end(); return; }
+    }
+    let fileName = 'pasted-text.txt', text = '';
+    try {
+      const j = JSON.parse(body.toString('utf8'));
+      text = String(j.text ?? '');
+      if (j.filename) fileName = String(j.filename);
+    } catch { text = body.toString('utf8'); }
+    const token = Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 10);
+    await fsp.mkdir(uploadRegistry.uploadDirPath(), { recursive: true });
+    const target = path.join(uploadRegistry.uploadDirPath(), `${token}__${safeBaseName(fileName)}`);
+    await fsp.writeFile(target, text, 'utf8');
+    logger.info(`[upload] 文本附件 ${safeBaseName(fileName)} (${text.length} chars) from ${req.socket.remoteAddress}`);
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ ok: true, path: target }));
+    return;
+  }
+
+  // ---------- 文件下载（原生「打开文件」手势的 Web 语义）----------
+  // GET /download?path=<绝对路径> —— openInFileManager / openInEditor 在 Web 端触发浏览器下载。
+  // 鉴权与其它路由一致（cookie / Bearer / ?token=，tokenFromReq 已在上面的总闸校验过）。
+  if (req.method === 'GET' && urlPath0 === '/download') {
+    const q = new URL(req.url, 'http://x').searchParams;
+    const raw = q.get('path') || '';
+    let target;
+    try { target = path.resolve(decodeURIComponent(raw)); } catch { target = path.resolve(raw); }
+    // 与 File RPC 通道同威胁模型：只读任意可读文件；但至少排除目录与不可读项
+    let st;
+    try { st = await fsp.stat(target); } catch { res.writeHead(404, { 'content-type': 'application/json' }); res.end(JSON.stringify({ ok: false, error: 'not_found' })); return; }
+    if (!st.isFile()) { res.writeHead(400, { 'content-type': 'application/json' }); res.end(JSON.stringify({ ok: false, error: 'not_a_file' })); return; }
+    const base = safeBaseName(path.basename(target));
+    // RFC 5987：非 ASCII 文件名双编码（filename* 生效时浏览器忽略 filename）
+    res.writeHead(200, {
+      'content-type': 'application/octet-stream',
+      'content-length': String(st.size),
+      'content-disposition': `attachment; filename="${base.replace(/["\r\n]/g, '_')}"; filename*=UTF-8''${encodeURIComponent(base)}`,
+      'cache-control': 'no-store',
+    });
+    if (req.method === 'HEAD') { res.end(); return; }
+    fs.createReadStream(target).pipe(res);
+    logger.info(`[download] ${base} (${st.size} bytes) → ${req.socket.remoteAddress}`);
+    return;
+  }
+
   try { await serveStatic(req, res); }
   catch (e) { logger.error('static error:', e); res.writeHead(500); res.end('internal error'); }
 });
@@ -370,7 +537,7 @@ server.on('upgrade', (req, socket, head) => {
 async function main() {
   const appServer = await startAppServer();
   const configPath = path.join(os.homedir(), '.zcode/cli/config.json');
-  const services = buildAllChannels({ appServer, workspaceRoot: WORKSPACE_ROOT, logger, configPath });
+  const services = buildAllChannels({ appServer, workspaceRoot: WORKSPACE_ROOT, logger, configPath, uploadRegistry });
 
   // ---------- 业务层健康探针 ----------
   // 「WebSocket 连上」≠「可以用了」：app-server 子进程可能已经死了，或者会话恢复后
