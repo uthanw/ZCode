@@ -10,7 +10,7 @@ import {
   type Theme,
 } from "@zcode/ui";
 import "@zcode/ui/styles.css";
-import { connectViaWebSocket } from "@zcode/client";
+import { connectViaResumableWebSocket } from "@zcode/client";
 import { WebCallbackPage } from "./auth/WebCallbackPage.js";
 import { createWebAuthService } from "./auth/webAuthService.js";
 import { WEB_ZAI_OAUTH_CONFIG, resolveWebAuthDevReturnTo } from "./auth/webZaiOAuthConfig.js";
@@ -30,6 +30,12 @@ import {
 } from "./share/conversationShareRoute.js";
 import type { IPlatformService, RemoteTarget, ServerRemoteInfo } from "@zcode/shared";
 import { WEB_DEFAULT_THEME, resolveWebInitialTheme } from "./webThemeSeed.js";
+import {
+  configureWebUpload,
+  getPathForFileOptimistic,
+  selectFileWeb,
+  selectFilesWeb,
+} from "./webUpload.js";
 
 function resolveWebThemePreference(defaultTheme: Theme = WEB_DEFAULT_THEME): Theme {
   const saved = localStorage.getItem("zcode-theme");
@@ -189,13 +195,15 @@ async function renderConversationSharePage(): Promise<void> {
 
 function createWebPlatform(): IPlatformService {
   return {
-    canSelectFilePath: false,
+    // Web 端经上传桥接返回服务器可读的绝对路径（拖拽乐观路径 + 选择器直传）
+    canSelectFilePath: true,
     // Web 端无法打开系统目录选择框
     selectDirectory: () => Promise.resolve(null),
-    // Web 端无法打开系统文件选择框
-    selectFile: () => Promise.resolve(null),
-    selectFiles: () => Promise.resolve([]),
-    getPathForFile: () => null,
+    // 回形针入口：原生文件选择器 → 上传 → 返回服务器磁盘路径
+    selectFile: selectFileWeb,
+    selectFiles: selectFilesWeb,
+    // 拖拽入口：乐观路径，同步返回预测落盘路径，字节在后台上传（见 webUpload.ts）
+    getPathForFile: getPathForFileOptimistic,
     createTempTextAttachment: () =>
       Promise.reject(new Error("Temporary text attachments require a desktop host")),
     onRemoteConnectionLog: () => () => {},
@@ -375,6 +383,10 @@ async function resolveWebBootstrap(): Promise<WebBootstrapResult> {
     }
     const serverInfo = (await response.json()) as Partial<ServerRemoteInfo>;
     const workspace = Array.isArray(serverInfo.workspaces) ? serverInfo.workspaces[0] : undefined;
+    if (workspace?.path) {
+      // 上传桥接需要 workspace 根来构造与服务器一致的预测落盘路径。
+      configureWebUpload({ workspaceRoot: workspace.path });
+    }
     return {
       wsUrl,
       ...(workspace?.path ? { initialWorkspaceAbsPath: workspace.path } : {}),
@@ -442,14 +454,23 @@ async function bootstrapWebApp() {
   }
 
   try {
-    const services = await connectViaWebSocket(bootstrap.wsUrl, {
-      onClose: () => {},
+    // 可恢复连接：断线后底层 WS 自动重连并重放未确认帧，ChannelClient 绑定的
+    // 端口保持不变；服务端按 cid 保留同一会话的订阅与进行中请求。
+    const services = await connectViaResumableWebSocket(bootstrap.wsUrl, {
+      ephemeral: new URLSearchParams(window.location.search).get("ephemeral") === "1",
     });
     const platform = createWebPlatform();
     document.title = "ZCode - Web + Server";
 
+    // Web 端透传桌面平台标志，复用桌面端同一套标题栏/侧栏折叠 UI：
+    // 否则 isDesktop=false 时 DesktopTopOverlay 的折叠按钮按平台分支全部不渲染，
+    // 侧栏收起后没有任何入口可以展开。判断方式与桌面 renderer 入口保持一致
+    // （UA 字符串匹配），浏览器里 UA 与 Electron 同源，Mac/Windows/Linux 三分支天然覆盖。
+    const isMacDesktop = navigator.userAgent.includes("Mac");
+    const isWindowsDesktop = navigator.userAgent.includes("Windows");
+
     root.render(
-      <AppErrorBoundary>
+      <AppErrorBoundary isDesktop isMacDesktop={isMacDesktop} isWindowsDesktop={isWindowsDesktop}>
         <ZCodeIntlProvider
           settingService={services.settingService}
           broadcastService={services.broadcastService}
@@ -457,6 +478,9 @@ async function bootstrapWebApp() {
           <Root
             services={services}
             platform={platform}
+            isDesktop
+            isMacDesktop={isMacDesktop}
+            isWindowsDesktop={isWindowsDesktop}
             initialWorkspaceAbsPath={bootstrap.initialWorkspaceAbsPath}
             initialWorkspaceIdentity={bootstrap.initialWorkspaceIdentity}
             initialTaskId={bootstrap.initialTaskId}

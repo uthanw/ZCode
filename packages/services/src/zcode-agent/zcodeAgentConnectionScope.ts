@@ -28,6 +28,12 @@ export interface ZCodeAgentV4ConnectionContext {
   connectionId: string;
   clientMode: ZCodeAgentV4ClientMode;
   role?: "terminal-client" | "trusted-host-relay";
+  /**
+   * Web 乐观上传闸门：sendText 转发前把注册引用（/upload-registry/&lt;token&gt; 或
+   * .uploads/&lt;token&gt;__&lt;name&gt; 占位路径）替换为已落盘的真实绝对路径。
+   * 只有 Web remote 路径注入此钩子；Desktop 本地零拷贝不需要。undefined → 不拦截。
+   */
+  resolveAttachmentRefs?: (attachments: unknown) => Promise<unknown>;
 }
 
 const TRUSTED_CONNECTION_FIELD = "__zcodeTrustedV4Connection";
@@ -687,6 +693,26 @@ export function createZCodeAgentConnectionScope(
           // 旧 facade 未覆盖 command 入口，未握手调用与伪造 clientId 都会
           // 直达 CLI；静默覆盖又会破坏 command 幂等归属，因此明确拒绝不一致。
           throw new Error("fault.command.clientMismatch");
+        }
+      }
+      // Web 乐观上传闸门：渲染器 getPathForFile 同步返回注册路径，字节上传在后台
+      // 进行。sendText 转发前必须等字节真正落盘——app-server 按零拷贝语义直接读该
+      // 路径。渲染器从不在 createSession.firstInput 里带附件（新会话一律 createSession
+      // 后紧跟 sendText），所以只闸 sendText 即完备。editUserQuery 同理带 attachments。
+      if (context.resolveAttachmentRefs) {
+        const payload = params.envelope.payload as
+          | { attachments?: unknown }
+          | null
+          | undefined;
+        if (
+          (params.envelope.type === "sendText" ||
+            params.envelope.type === "editUserQuery") &&
+          Array.isArray(payload?.attachments) &&
+          payload.attachments.length > 0
+        ) {
+          payload.attachments = (await context.resolveAttachmentRefs(
+            payload.attachments,
+          )) as unknown[];
         }
       }
       // command 过去只校验 envelope.clientId，却没有像订阅、附件一样注入

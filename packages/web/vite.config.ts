@@ -55,6 +55,14 @@ export default defineConfig(({ mode }) => {
     },
     server: {
       port: 5173,
+      // 反向代理/NAT 网关从内网地址转发进来时，绑回环它够不着；默认仍只监听本机。
+      // 出口域名与本机不同源时 Vite 会拦，按需通过环境变量放行（逗号分隔）。
+      ...(process.env["ZCODE_WEB_DEV_HOST"]?.trim()
+        ? { host: process.env["ZCODE_WEB_DEV_HOST"].trim() }
+        : {}),
+      ...(process.env["ZCODE_WEB_DEV_ALLOWED_HOSTS"]?.trim()
+        ? { allowedHosts: process.env["ZCODE_WEB_DEV_ALLOWED_HOSTS"].split(",").map((h) => h.trim()).filter(Boolean) }
+        : {}),
       proxy: {
         // Web 登录本地调试时，OAuth token 交换必须先命中线上同源接口。
         // 该专用代理放在 `/api` 通配代理之前，避免被转发到本地 server 导致 404。
@@ -66,6 +74,9 @@ export default defineConfig(({ mode }) => {
         // 将 /ws 和 /api 请求代理到 server（默认 3030 端口）
         "/ws": { target: "ws://localhost:3030", ws: true },
         "/api": { target: "http://localhost:3030" },
+        // 文件上传桥接端点（/upload*、/uploads/:token）也由 server 处理
+        "/upload": { target: "http://localhost:3030" },
+        "/uploads": { target: "http://localhost:3030" },
       },
     },
     optimizeDeps: {

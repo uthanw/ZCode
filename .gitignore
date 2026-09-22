@@ -69,3 +69,7 @@ packages/desktop/.e2e-artifacts/
 packages/desktop/.e2e-cache/
 packages/desktop/.e2e-network-capture/
 .zcode-runtime/
+
+# 本地运行时产物：上传落地目录与默认工作区，含用户数据，绝不入库
+packages/server/.uploads/
+ws-official/
