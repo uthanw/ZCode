@@ -1,4 +1,8 @@
 /* eslint-disable max-lines -- HTTP、WebSocket 与静态资源路由集中注册，保持同一鉴权顺序。 */
+import {
+  createServer as createHttpsServer,
+  type ServerOptions as HttpsServerOptions,
+} from "node:https";
 import { randomUUID } from "node:crypto";
 import { readFile, stat } from "node:fs/promises";
 import { basename, extname, relative, resolve, sep } from "node:path";
@@ -40,6 +44,7 @@ import {
 } from "@zcode/shared";
 import { connectRemote, createRemoteBackend, type RemoteConnection } from "./remote/index.js";
 import { createHostCapabilityStore } from "./hostCapability.js";
+import type { TlsMaterial } from "./tls.js";
 
 function wrapWebSocket(ws: WebSocket): ISocket {
   const onData = new Emitter<VSBuffer>();
@@ -140,6 +145,8 @@ interface HttpServerOptions {
   spaFallback?: boolean;
   staticRoot?: string;
   workspaces?: ServerRemoteWorkspaceInfo[];
+  /** TLS 材料；提供时以 https 监听，cookie 增加 Secure 属性（见 spec/web-server-tls.md）。 */
+  tls?: TlsMaterial;
 }
 
 function readTrimmedEnv(name: string): string | undefined {
@@ -224,12 +231,14 @@ function parseCookieHeader(header: string | undefined): Map<string, string> {
   return cookies;
 }
 
-function hasValidLiteToken(c: Context, token: string): boolean {
+function hasValidLiteToken(c: Context, token: string, secure: boolean): boolean {
   const url = new URL(c.req.url);
   if (url.searchParams.get("token") === token) {
+    // TLS 监听时 cookie 必须带 Secure，避免令牌在非加密链路回传（见 spec/web-server-tls.md）。
+    const secureAttribute = secure ? "; Secure" : "";
     c.header(
       "Set-Cookie",
-      `${zcodeLiteTokenCookieName}=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Lax`,
+      `${zcodeLiteTokenCookieName}=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Lax${secureAttribute}`,
     );
     return true;
   }
@@ -305,10 +314,11 @@ export function createHttpServer(
   const hostCapabilities = createHostCapabilityStore();
 
   const authToken = options.authToken?.trim();
+  const tlsEnabled = Boolean(options.tls);
   if (authToken) {
     app.use("*", async (c, next) => {
       const pathname = new URL(c.req.url).pathname;
-      const validToken = hasValidLiteToken(c, authToken);
+      const validToken = hasValidLiteToken(c, authToken, tlsEnabled);
       if (!isTokenProtectedPath(pathname) || validToken) {
         await next();
         return;
@@ -463,12 +473,31 @@ export function createHttpServer(
     });
   }
 
-  const server = serve({ fetch: app.fetch, hostname: options.host, port }, () => {
-    const address = server.address();
-    const listenPort = typeof address === "object" && address ? address.port : port;
-    const listenHost = options.host?.trim() || "localhost";
-    log(`http://${listenHost}:${listenPort}`);
-  });
+  // TLS 材料存在时走 node:https；@hono/node-server 通过 createServer 覆盖项创建
+  // HTTPS 服务，@hono/node-ws 的 injectWebSocket 只挂 "upgrade" 事件，对 https.Server 同样生效。
+  const server = serve(
+    {
+      fetch: app.fetch,
+      hostname: options.host,
+      port,
+      ...(options.tls
+        ? {
+            createServer: createHttpsServer,
+            serverOptions: {
+              key: options.tls.key,
+              cert: options.tls.cert,
+            } satisfies HttpsServerOptions,
+          }
+        : {}),
+    },
+    () => {
+      const address = server.address();
+      const listenPort = typeof address === "object" && address ? address.port : port;
+      const listenHost = options.host?.trim() || "localhost";
+      const scheme = tlsEnabled ? "https" : "http";
+      log(`${scheme}://${listenHost}:${listenPort}`);
+    },
+  );
 
   injectWebSocket(server);
 
