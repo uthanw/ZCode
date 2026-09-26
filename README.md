@@ -102,7 +102,7 @@ zcode --web --help
 
 Web 模式默认工作目录为当前目录，监听 `127.0.0.1`，默认不启用访问令牌，自动选择空闲端口并打开浏览器。访问终端输出的地址，按 `Ctrl+C` 停止服务。局域网访问可使用 `--host 0.0.0.0`；监听非本机地址时默认生成访问令牌，使用终端输出的带令牌链接。可通过 `--token` 指定令牌或 `--no-token` 关闭令牌认证。
 
-直接启动通用 Web 服务的 HTTP 入口时，通过 `ZCODE_SERVER_AUTH_TOKEN` 配置 API／WebSocket 认证；通过程序接口创建服务时，使用 `authToken` 选项。
+直接启动通用 Web 服务的 HTTP 入口时，通过 `ZCODE_SERVER_AUTH_TOKEN` 配置 API／WebSocket 认证；通过程序接口创建服务时，使用 `authToken` 选项。需要 HTTPS 时，同时设置 `ZCODE_SERVER_TLS_CERT` 与 `ZCODE_SERVER_TLS_KEY` 指向 PEM 证书和私钥；没有现成证书时可设 `ZCODE_SERVER_TLS_SELF_SIGNED=1` 由服务自动生成并缓存自签证书（浏览器会提示不受信任，选择继续访问即可）。配置不完整或证书不可读时服务会拒绝启动，不会静默回退为 HTTP；详见 [packages/server/spec/web-server-tls.md](packages/server/spec/web-server-tls.md)。
 
 构建方式见下方打包章节。`pnpm build:zcode` 只生成发行包，不会替换 `PATH` 中已有的 `zcode`。如果命令仍指向旧安装或其他源码目录，macOS / Linux 可用 `command -v zcode` 检查，Windows 可用 `where.exe zcode` 检查。
 
@@ -129,6 +129,9 @@ node apps/zcode-cli/packages/cli/dist/zcode.cjs --help
 | ------------------------------------ | ------------------------------------------------ |
 | `ZCODE_DATA_BASE_DIR`                | 应用数据基目录，数据写入其下的 `.zcode/`         |
 | `ZCODE_SERVER_WORKSPACE`             | Web 后端的工作区路径                             |
+| `ZCODE_SERVER_TLS_CERT`              | Web 后端 HTTPS 的 PEM 证书路径，须与 KEY 同时设置 |
+| `ZCODE_SERVER_TLS_KEY`               | Web 后端 HTTPS 的 PEM 私钥路径，须与 CERT 同时设置 |
+| `ZCODE_SERVER_TLS_SELF_SIGNED`       | 设为 `1` 时自动生成并缓存自签 HTTPS 证书          |
 | `ZCODE_BUILTIN_PROVIDER_CONFIG_FILE` | 本地 Provider 配置文件路径；未设置时使用内置配置 |
 | `ZCODE_DIST_BASE_URL`                | 命令行安装脚本使用的下载根地址                   |
 

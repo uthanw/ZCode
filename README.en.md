@@ -96,7 +96,7 @@ zcode --web --help
 
 In Web mode, it uses the current directory as the workspace, listens on `127.0.0.1` without token authentication by default, selects an available port, and opens a browser. Use the URL printed in the terminal and press `Ctrl+C` to stop the service. For LAN access, use `--host 0.0.0.0`; listening on a non-local address generates an access token by default. Use the token-bearing URL printed in the terminal. Set a token with `--token`, or disable token authentication with `--no-token`.
 
-When starting the general Web service's HTTP entry directly, configure API/WebSocket authentication with `ZCODE_SERVER_AUTH_TOKEN`. When creating the service programmatically, use the `authToken` option.
+When starting the general Web service's HTTP entry directly, configure API/WebSocket authentication with `ZCODE_SERVER_AUTH_TOKEN`. When creating the service programmatically, use the `authToken` option. For HTTPS, set `ZCODE_SERVER_TLS_CERT` and `ZCODE_SERVER_TLS_KEY` to the PEM certificate and private key; without an existing certificate, set `ZCODE_SERVER_TLS_SELF_SIGNED=1` to generate and cache a self-signed one automatically (the browser will warn that it is untrusted). Incomplete or unreadable TLS configuration makes the service refuse to start instead of silently falling back to HTTP; see [packages/server/spec/web-server-tls.md](packages/server/spec/web-server-tls.md).
 
 See Packaging below for build instructions. `pnpm build:zcode` only creates the distribution; it does not replace an existing `zcode` on `PATH`. If the command still points to an older installation or another checkout, check it with `command -v zcode` on macOS / Linux or `where.exe zcode` on Windows.
 
@@ -123,6 +123,9 @@ The root [.env.example](.env.example) provides sample service URLs and build con
 | ------------------------------------ | --------------------------------------------------------------------------------------- |
 | `ZCODE_DATA_BASE_DIR`                | Base directory for application data, stored under its `.zcode/` subdirectory            |
 | `ZCODE_SERVER_WORKSPACE`             | Workspace path for the Web backend                                                      |
+| `ZCODE_SERVER_TLS_CERT`              | PEM certificate path for Web-backend HTTPS; must be set together with KEY                |
+| `ZCODE_SERVER_TLS_KEY`               | PEM private key path for Web-backend HTTPS; must be set together with CERT               |
+| `ZCODE_SERVER_TLS_SELF_SIGNED`       | Set to `1` to generate and cache a self-signed HTTPS certificate automatically           |
 | `ZCODE_BUILTIN_PROVIDER_CONFIG_FILE` | Path to a local provider configuration file; uses the built-in configuration when unset |
 | `ZCODE_DIST_BASE_URL`                | Download base URL used by the CLI distribution installer                                |
 
