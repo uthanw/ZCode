@@ -1,0 +1,235 @@
+<!-- server/inject/login.html —— 访问令牌登录门户
+风格对齐 ZCode 渲染器（Tailwind v4 + shadcn 语义 token）：
+  背景中性暗色 #161616（--color-background），卡片 #2b2b2b（--color-card），
+  前景 neutral-200/400，边框 white/10%，圆角走 --radius-lg(.5rem) 体系。
+零依赖：无外部字体/图标/JS 框架，逻辑仅一个 fetch + 种 cookie 后跳转。 -->
+<!doctype html>
+<html lang="zh-CN" class="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>ZCode · 登录</title>
+    <style>
+      :root {
+        --color-background: #161616;
+        --color-card: #2b2b2b;
+        --color-card-foreground: #e5e5e5;      /* neutral-200 */
+        --color-foreground: #e5e5e5;
+        --color-muted-foreground: #a3a3a3;     /* neutral-400 */
+        --color-primary: #ffffff;
+        --color-primary-foreground: #0a0a0a;   /* neutral-950 */
+        --color-destructive: #ff5c5c;
+        --color-border: rgba(255, 255, 255, 0.1);
+        --color-input: rgba(255, 255, 255, 0.12);
+        --radius-lg: 0.5rem;
+        --radius-xl: 0.75rem;
+      }
+      * { box-sizing: border-box; margin: 0; padding: 0; }
+      html, body { height: 100%; }
+
+      body {
+        background: var(--color-background);
+        color: var(--color-foreground);
+        font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
+          "Helvetica Neue", Arial, "PingFang SC", "Hiragino Sans GB",
+          "Microsoft YaHei", sans-serif;
+        -webkit-font-smoothing: antialiased;
+        display: flex; align-items: center; justify-content: center;
+        min-height: 100vh; padding: 1.5rem;
+      }
+
+      /* 背景微光：与启动页同款的深色底渐变 */
+      .bg-glow {
+        position: fixed; inset: 0; z-index: -1; pointer-events: none;
+        background:
+          radial-gradient(600px 400px at 50% -10%, rgba(255, 255, 255, 0.05), transparent 60%),
+          linear-gradient(180deg, #000 0%, #151718 100%);
+      }
+
+      .card {
+        width: 100%; max-width: 380px;
+        background: var(--color-card);
+        color: var(--color-card-foreground);
+        border: 1px solid var(--color-border);
+        border-radius: var(--radius-xl);
+        box-shadow:
+          0 20px 25px -5px rgb(0 0 0 / 0.2),
+          0 8px 10px -6px rgb(0 0 0 / 0.2);
+        padding: 2rem 2rem 1.75rem;
+        animation: card-pop 0.72s cubic-bezier(0.22, 1, 0.36, 1) both;
+      }
+      @keyframes card-pop {
+        0% { opacity: 0; transform: scale(0.96) translateY(8px); }
+        100% { opacity: 1; transform: scale(1) translateY(0); }
+      }
+      @media (prefers-reduced-motion: reduce) {
+        .card { animation: none; }
+      }
+
+      .card-header { display: flex; flex-direction: column; align-items: center; gap: 0.875rem; margin-bottom: 1.5rem; }
+      .logo-shell {
+        display: flex; width: 56px; height: 56px; align-items: center; justify-content: center;
+        border-radius: 14px;
+        background: linear-gradient(180deg, #000000 0%, #151718 100%);
+        border: 1px solid rgba(255, 255, 255, 0.1);
+        box-shadow: 0 10px 15px -3px rgb(0 0 0 / 0.3);
+      }
+      .logo-shell svg { width: 30px; height: auto; color: #fff; }
+      .card-title { font-size: 1.125rem; font-weight: 600; letter-spacing: -0.01em; text-align: center; }
+      .card-desc { font-size: 0.8125rem; color: var(--color-muted-foreground); text-align: center; line-height: 1.5; }
+
+      .field { margin-bottom: 1rem; }
+      .label {
+        display: block; font-size: 0.8125rem; font-weight: 500; margin-bottom: 0.4rem;
+        color: var(--color-foreground);
+      }
+      .input {
+        width: 100%; height: 2.5rem; padding: 0 0.75rem;
+        background: transparent; color: var(--color-foreground);
+        border: 1px solid var(--color-input);
+        border-radius: var(--radius-lg);
+        font-size: 0.875rem; font-family: inherit;
+        transition: border-color 0.15s ease, box-shadow 0.15s ease;
+        outline: none;
+      }
+      .input::placeholder { color: var(--color-muted-foreground); opacity: 0.7; }
+      .input:focus {
+        border-color: rgba(255, 255, 255, 0.4);
+        box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.12);
+      }
+      .input.invalid { border-color: var(--color-destructive); box-shadow: 0 0 0 2px rgba(255, 92, 92, 0.15); }
+
+      .button {
+        width: 100%; height: 2.5rem; margin-top: 0.25rem;
+        background: var(--color-primary); color: var(--color-primary-foreground);
+        border: none; border-radius: var(--radius-lg);
+        font-size: 0.875rem; font-weight: 600; font-family: inherit;
+        cursor: pointer;
+        transition: opacity 0.15s ease;
+      }
+      .button:hover { opacity: 0.9; }
+      .button:active { opacity: 0.8; }
+      .button:disabled { opacity: 0.5; cursor: not-allowed; }
+
+      .alert {
+        display: none;
+        margin-bottom: 1rem; padding: 0.625rem 0.75rem;
+        border: 1px solid rgba(255, 92, 92, 0.3);
+        background: rgba(255, 92, 92, 0.08);
+        color: var(--color-destructive);
+        border-radius: var(--radius-lg);
+        font-size: 0.8125rem; line-height: 1.45;
+      }
+      .alert.show { display: block; animation: shake 0.3s ease; }
+      @keyframes shake {
+        0%, 100% { transform: translateX(0); }
+        25% { transform: translateX(-4px); }
+        75% { transform: translateX(4px); }
+      }
+
+      .card-footer { margin-top: 1.25rem; padding-top: 1rem; border-top: 1px solid var(--color-border); }
+      .footer-text { font-size: 0.75rem; color: var(--color-muted-foreground); text-align: center; line-height: 1.5; }
+      .footer-text code {
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        font-size: 0.6875rem; color: var(--color-foreground);
+        background: rgba(255, 255, 255, 0.06);
+        padding: 0.1em 0.4em; border-radius: 4px;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="bg-glow"></div>
+    <main class="card">
+      <div class="card-header">
+        <div class="logo-shell">
+          <!-- ZCode 原版启动 logo（与 renderer/index.html 完全一致的 path 数据） -->
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 218" fill="none" aria-hidden="true">
+            <path
+              fill="currentColor"
+              d="M134.4 0.130152L116.48 25.6022C113.665 29.5699 109.054 32.0019 104.064 32.0019H6.3999V0C6.3999 0.130149 134.4 0.130152 134.4 0.130152Z"
+            />
+            <path fill="currentColor" d="M256 0.130127L102.401 217.732H0L153.599 0.130127H256Z" />
+            <path
+              fill="currentColor"
+              d="M121.601 217.732L139.65 192.134C142.465 188.166 147.076 185.734 152.067 185.734H249.604V217.736H121.601V217.732Z"
+            />
+          </svg>
+        </div>
+        <h1 class="card-title">ZCode Web</h1>
+        <p class="card-desc">访问此工作区需要访问令牌</p>
+      </div>
+
+      <div class="alert" id="alert" role="alert"></div>
+
+      <form id="login-form" autocomplete="off">
+        <div class="field">
+          <label class="label" for="token">访问令牌</label>
+          <input
+            class="input"
+            id="token"
+            name="token"
+            type="password"
+            placeholder="粘贴你的访问令牌"
+            required
+            autofocus
+          />
+        </div>
+        <button class="button" id="submit" type="submit">进入工作台</button>
+      </form>
+
+      <div class="card-footer">
+        <p class="footer-text">
+          令牌由服务端 <code>ZCODE_SERVER_AUTH_TOKEN</code> 配置 ·
+          登录即写入 HttpOnly Cookie，后续访问无需再次输入
+        </p>
+      </div>
+    </main>
+
+    <script>
+      (function () {
+        'use strict';
+        var form = document.getElementById('login-form');
+        var input = document.getElementById('token');
+        var alert = document.getElementById('alert');
+        var btn = document.getElementById('submit');
+
+        function fail(msg) {
+          alert.textContent = msg;
+          alert.classList.add('show');
+          input.classList.add('invalid');
+          input.select();
+        }
+
+        form.addEventListener('submit', function (e) {
+          e.preventDefault();
+          alert.classList.remove('show');
+          input.classList.remove('invalid');
+          btn.disabled = true;
+          btn.textContent = '验证中…';
+          fetch('/login', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ token: input.value }),
+          })
+            .then(function (r) {
+              if (r.ok) { window.location.replace('/'); return; }
+              input.classList.add('invalid');
+              return r.json().then(
+                function (j) { fail((j && j.error) || '令牌无效，请检查后重试'); },
+                function () { fail('令牌无效，请检查后重试'); }
+              );
+            })
+            .catch(function () { fail('网络错误，请重试'); })
+            .finally(function () {
+              btn.disabled = false;
+              btn.textContent = '进入工作台';
+            });
+        });
+        input.addEventListener('input', function () {
+          alert.classList.remove('show');
+          input.classList.remove('invalid');
+        });
+      })();
+    </script>
+  </body>
+</html>
