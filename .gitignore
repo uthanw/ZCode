@@ -69,8 +69,3 @@ packages/desktop/.e2e-artifacts/
 packages/desktop/.e2e-cache/
 packages/desktop/.e2e-network-capture/
 .zcode-runtime/
-
-# 本地运行时产物：上传落地目录随工作区生成，含用户数据，绝不入库。
-# 工作区目录本身是机器本地的个人数据，各机器用 .git/info/exclude 自行忽略，
-# 不把具体目录名写进通用 ignore。
-packages/server/.uploads/
