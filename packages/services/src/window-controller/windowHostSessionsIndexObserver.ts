@@ -1,5 +1,8 @@
 import type { IDisposable } from "@zcode/rpc";
-import { ZCODE_AGENT_RUNTIME_UNAVAILABLE_CODE, type IZCodeAgentService } from "@zcode/services";
+import {
+  ZCODE_AGENT_RUNTIME_UNAVAILABLE_CODE,
+  type IZCodeAgentService,
+} from "../zcode-agent/zcodeAgent.js";
 import {
   PROTOCOL_V4_LIMITS,
   sessionsIndexTopic,

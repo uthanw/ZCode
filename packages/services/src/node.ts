@@ -296,6 +296,16 @@ import { ICredentialService } from "./credential/credential.js";
 import { IBroadcastService } from "./broadcast/broadcast.js";
 import { IZCodeTaskService } from "./session/zcodeTaskService.js";
 import { IZCodeAgentService } from "./zcode-agent/zcodeAgent.js";
+import { registerLocalWindowControllerService } from "./window-controller/localWindowControllerRuntime.js";
+
+// Window Host Controller 运行时已从 desktop host 迁入 services 包（Desktop Host 与 standalone
+// server 共用同一实现）。Desktop 侧只消费工厂本身，本地只认 source 的装配在
+// createLocalServices 内按 authority mode 自动完成。
+export {
+  createWindowHostControllerRuntime,
+  type ResolvedWindowHostControllerSource,
+} from "./window-controller/windowHostControllerRuntime.js";
+export { registerLocalWindowControllerService } from "./window-controller/localWindowControllerRuntime.js";
 import type { CuaOperationStateReporter } from "./zcode-agent/cuaOperationTurnTracker.js";
 import { IZCodeSessionService } from "./zcode-session/zcodeSession.js";
 import {
@@ -656,6 +666,10 @@ export type OffPeakRequestAuthBuilder = (
   ticketId: string,
 ) => Promise<{ apiKey: string; headers: Record<string, string> }>;
 const offPeakRequestAuthBuilders = new WeakMap<ServiceCollection, OffPeakRequestAuthBuilder>();
+// 非 Desktop 宿主（standalone server / HTTP 入口）没有 windowRemoteConnectionRegistry，无法复用
+// Desktop Host 的远端路由，需要自带一份只认本地 source 的 WindowController 装配。与其它侧表一样
+// 按 ServiceCollection 登记，dispose 时统一释放（否则订阅/观察器会悬在已回收的 services 上）。
+const localWindowControllerRuntimes = new WeakMap<ServiceCollection, { dispose(): void }>();
 
 /** Local Host 进程内能力；不会随 ServiceCollection 暴露到通用 RPC Channel。 */
 export function getAccountRequestAuthService(
@@ -2650,6 +2664,17 @@ export function createLocalServices(options: {
     },
   );
 
+  // 非 Desktop 宿主（standalone server / HTTP 入口）此前完全没有注册 WindowController，导致
+  // renderer 的全局任务列表（pinned/timeline/archived 与 header 计数）静默为空——只有项目内任务走
+  // zcodeTaskService 另一条路径仍能显示。Desktop Host 自身装配（含 windowRemoteConnectionRegistry
+  // 远端路由），desktop-attached-remote 也同样由 Desktop Host 负责，这里都不重复注册。
+  if (
+    options?.serviceAuthorityMode !== "desktop-local" &&
+    options?.serviceAuthorityMode !== "desktop-attached-remote"
+  ) {
+    localWindowControllerRuntimes.set(services, registerLocalWindowControllerService(services));
+  }
+
   // 见 sharedSqliteRepos 声明处注释：登记全部 tasks-index sqlite 句柄，dispose 链统一关闭
   sqliteReposToClose.push(taskIndexRepo);
   sharedSqliteRepos.set(services, sqliteReposToClose);
@@ -2767,6 +2792,8 @@ export function disposeServiceResources(services: ServiceCollection): void {
   providerProvisioningTriggerDisposers.delete(services);
   providerProvisioningSources.delete(services);
   managedHostApiNetworkTransports.get(services)?.dispose();
+  localWindowControllerRuntimes.get(services)?.dispose();
+  localWindowControllerRuntimes.delete(services);
 }
 
 export async function disposeServiceResourcesAndWait(services: ServiceCollection): Promise<void> {
@@ -2807,4 +2834,6 @@ export async function disposeServiceResourcesAndWait(services: ServiceCollection
     .get(services)
     ?.disposeAndWait()
     .catch(() => {});
+  localWindowControllerRuntimes.get(services)?.dispose();
+  localWindowControllerRuntimes.delete(services);
 }

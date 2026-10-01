@@ -1,7 +1,7 @@
 /* eslint-disable max-lines -- 投影状态、V4 帧与离线替换属于同一个一致性边界。 */
 import { isDeepStrictEqual } from "node:util";
 import type { ZCodeTaskMeta } from "@zcode/shared";
-import type { ZCodeArchivedTaskDeletionResult } from "@zcode/services";
+import type { ZCodeArchivedTaskDeletionResult } from "../session/zcodeTaskService.js";
 import {
   CONTROLLER_TASKS_INDEX_TOPIC,
   CONTROLLER_WORKSPACES_TOPIC,
