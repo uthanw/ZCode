@@ -247,3 +247,108 @@ journalctl -u zcode-official --since "-10 min" | grep -A4 "spawn preflight" | gr
 | agent 内存高 | `ps --ppid <server-pid>` | 常驻设计使然；控制同时活跃的工作区数量 |
 | 数据库过大 | `~/.zcode/cli/db/db.sqlite` | 归档旧会话（官方暂无清理命令） |
 | 改了某 packages/* 源码后 CLI 构建报类型错 | 该包 dist 过期 | 先 `npx tsc`（在该包内）再重跑 CLI bundle 构建 |
+
+---
+
+## 9. 本 fork 相对上游的自有改动
+
+以 `git diff upstream/main..HEAD` 为准（基准：上游 `zai-org/ZCode` main = v3.14.3，`29628c9`）。fork 共多 12 个提交、28 个文件、约 +4200 行。改动集中在四个主题，**均为上游没有的能力**，合并上游时是重点关照对象：
+
+### 9.1 Web 自托管核心（移植自 zcode-web-next 垫片，`8e2d2ba`）
+
+上游的 web server 是无鉴权、无上传、断线即断言的裸 HTTP 入口。fork 从旧垫片项目 TypeScript 重写移植了完整自托管层：
+
+| 能力 | 文件 | 说明 |
+|---|---|---|
+| 文件上传桥接 | `packages/web/src/webUpload.ts`（616 行）+ `packages/server/src/uploadRegistry.ts`（656 行） | 乐观路径/XHR 断点续传；服务端内容寻址落盘、sha256 校验、去重 |
+| 非 HTTPS 环境哈希 | `packages/web/src/sha256Core.ts` + `sha256Worker.ts` | 纯 JS 流式 SHA-256（自签/明文时无 SubtleCrypto）；含一个 fork 修复：compress() 原只处理首个 64 字节块，公网非安全上下文曾致 sha_mismatch |
+| 可恢复 WebSocket | `packages/client/src/resumableWebSocket.ts`（560 行）+ `packages/server/src/resumable.ts`（508 行） + `packages/client/src/websocket.ts`（+57 行接线） | 断线按 cid 复用同一 ChannelServer，帧编号 + 缺口重放；不可恢复时整页重载（订阅已失效，假装连着比掉线更糟）；含休眠唤醒/网络恢复探测 |
+| 鉴权门户 | `packages/server/src/http.ts` 内 token 中间件 + `packages/server/inject/login.html`（235 行） | 见 §4.3；上游完全没有 |
+| web 端桌面化 | `packages/web/src/main.tsx`（+42 行） | 透传桌面平台标志，复用桌面标题栏/侧栏折叠 UI |
+| vite dev 配置 | `packages/web/vite.config.ts`（+11 行） | dev server 的 host/allowedHosts 由环境变量驱动（`ZCODE_WEB_DEV_HOST` / `ZCODE_WEB_DEV_ALLOWED_HOSTS`），去除本机特征 |
+| 集成测试探针 | `probe-client.mts` | RPC 探针客户端（调试用，非产品依赖） |
+
+### 9.2 HTTPS（`d09ef0d` + `64d852b`）
+
+- `packages/server/src/tls.ts`（138 行）+ `tls-forge.d.ts`：显式 cert/key 或自动自签（§5）；规范文档 `packages/server/spec/web-server-tls.md`；测试 `packages/server/test/web-server-tls.test.ts`（node:test，覆盖 TLS 解析、自签幂等、HTTPS/WSS 握手、Secure cookie）。
+- `entry-http.ts` 接线 +6 行；`http.ts` TLS 时 cookie 加 `Secure`。
+- README 双语补充环境变量说明。
+
+### 9.3 Window Controller 非桌面宿主注册（`f2464f9`）
+
+上游把 Window Host Controller 运行时（pin/timeline/archived 列表聚合、sessions-index 观察）装配在 Desktop Host 里，standalone server **从未注册** `IWindowControllerService`——后果是 Web 端的全局任务列表和 header 计数静默为空（只有项目内任务走 zcodeTaskService 另一条路径能显示）。
+
+fork 做了一次**跨包迁移**：运行时从 `packages/desktop/src/host/` 迁入 `packages/services/src/window-controller/`（4 个文件，desktop 只改 import 指向新 `@zcode/services/node` 出口），并新增 `registerLocalWindowControllerService`——只认本地 source、远端身份 fail closed（server 没有 `windowRemoteConnectionRegistry` 可路由），挂进 `createLocalServices` 的非桌面 authority 分支，用 WeakMap 侧表保证 dispose 释放。
+
+### 9.4 文档与仓库卫生（其余提交）
+
+- `edecf49` / `2af7092`：从共享 .gitignore 移除机器特定路径（`ws-official/`、上传目录），改由各机 `.git/info/exclude` 自理。
+- `ff80c6f`：本文件 DEPLOY.md。
+- `10b6522` / `26d05bd`:合并 origin（fork 远端）与上游 main 的合并提交，无实质改动。
+
+**不在上游也不在本清单的**：工作区内未提交内容（如 `storage-startup.ts` 的首帧顺序修正等本地实验）不属于 fork 历史的一部分，详见 `git status`。
+
+---
+
+## 10. 合并上游升级流程
+
+上游仓库 `https://github.com/zai-org/ZCode`；本地以 `upstream` 远端跟踪它的 main（fork 自身远端 `origin` 是 GitHub 上的个人 fork）。节奏不固定——历史上游 v3.14.3（2026-09-23 开源更新）至今无新提交，但流程按每次都要走一遍准备。
+
+### 10.1 合并前：摸清碰撞面
+
+fork 的改动都是「上游没有的功能粘贴」，**不是侵入式改写上游代码**，所以大部分文件是纯新增（new file），git 能自动合并。真正的碰撞面只有 5 个「上游文件 + fork 增量」：
+
+| 上游文件 | fork 增量 | 冲突风险 |
+|---|---|---|
+| `packages/server/src/http.ts` | +450 行（鉴权中间件、上传路由、登录页） | **最高**——fork 改动横跨鉴权/路由/静态托管/WS 注入多个区域，上游动了 server 层几乎必撞 |
+| `packages/server/src/entry-http.ts` | +8 行（TLS 解析接线） | 低——入口函数尾部追加 |
+| `packages/web/src/main.tsx` | +42/-11 | 中——bootstrap 逻辑，上游常改 |
+| `packages/client/src/websocket.ts` | +57 行（文件尾新增函数） | 低 |
+| `packages/services/src/node.ts` | +29 行（window-controller 导出与注册） | 低——但模式聚合大文件，上游新增导出时会有同类行冲突 |
+
+另外注意 `packages/desktop/src/host/index.ts` 的 import 改向（window controller 迁移的配套，2 行）——若上游重构 desktop host，`9.3` 的迁移可能要重做（路径重新搬一次）。
+
+### 10.2 合并操作
+
+```bash
+cd /root/zcode-official
+git fetch origin                        # 先同步自己的远端（如果别处推过）
+git fetch upstream
+git log HEAD..upstream/main --oneline   # 看上游有什么新东西（当前为空 = 无需合并）
+
+# 建议留一条可回退的分支线，不要直接在 main 上合：
+git switch main
+git merge upstream/main
+
+# 若冲突（预期集中在 10.1 表格的文件）：
+git status                        # 逐个解决
+git mergetool                     # 或手动
+git merge --continue
+```
+
+冲突解决原则：**fork 侧的鉴权/上传/TLS/resumable WebSocket 的逻辑块一律保留**，把它当补丁重新贴到上游的新代码结构上，而不是接受任一侧的整文件版本。`http.ts` 冲突时优先看上游是否也新增了中间件或路由常量（比如新的 protection path），fork 的 `isTokenProtectedPath`/`hasValidLiteToken`/`registerUploadRoutes` 三块是核心，别丢。
+
+### 10.3 合并后：验证与重建（可直接复用 §3.2 / §7 的命令）
+
+```bash
+pnpm install                                # 依赖可能变了
+pnpm --filter "@zcode/cli..." build          # 注意 §3.2 的坑：上游若动了 workspace
+pnpm --filter @zcode/server build            #   内部包，dist 过期链会报类型错
+pnpm --filter @zcode/web build
+
+node packages/server/test/web-server-tls.test.ts   # 或 npx tsx 跑——确保 9.2 的测试还过
+git push origin main                         # 确认无误后推 fork 远端
+systemctl restart zcode-official             # 走 §7 升级重启
+```
+
+功能冒烟（Web 端，2 分钟清单）：
+
+1. `https://host:3030/?token=<token>` 能进且 cookie 生效（登出门户正常出 302）。
+2. 首页打开一个**旧工作区的任务**——验证 9.3 的全局任务列表非空（这个功能静默失效，不冒烟不会发现）。
+3. 拖一个文件上传到会话——验证上传桥接链路。
+4. 刷新页面时 WebSocket 重连（Network 面板 /ws 帧重放）——验证 resumable 层。
+5. `journalctl -u zcode-official | grep "command resolved"` 后续 spawn 仍是 `dist/zcode.cjs`。
+
+### 10.4 回退
+
+合并出问题未推远端时：`git reset --hard ORIG_HEAD`。已重启服务发现问题：`git reset --hard <旧提交> && 重建 §3.2 && systemctl restart`。数据目录（`ZCODE_DATA_BASE_DIR`）与代码完全分离，任何代码层回退不动数据；但**跳版本降级**（上游若带来 db schema 迁移）时旧代码可能读不了新库——回退前备份 `~/.zcode/cli/db/db.sqlite` 与 `~/.zcode/v2/`（约 700MB，闭眼备份即可）。
