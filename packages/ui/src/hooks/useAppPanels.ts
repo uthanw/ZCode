@@ -1574,6 +1574,9 @@ export function useAppPanels(options: {
     isSidePaneCollapsed,
     setIsSidePaneCollapsed,
     isSidebarVisible,
+    // 侧栏折叠态也需要由 shell 反向驱动：用户把分隔条拖到底要把侧栏收起，
+    // 拖回来要能展开，这时候走的是拖拽路径而不是顶部按钮。
+    setIsSidebarVisible,
     browserNavigationRequest,
     setBrowserNavigationRequest,
     // 回调

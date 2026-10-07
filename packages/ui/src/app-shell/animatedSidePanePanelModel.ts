@@ -53,7 +53,9 @@ export function resolveAnimatedSidePanePanelLayout() {
   return {
     collapsedSize: "0px",
     defaultSize: "0px",
-    maxSize: "65%",
+    // 上限从 65% 放宽到 100%：65% 时右侧面板没法占满主区域，
+    // 也没法把聊天区完全折叠。聊天区能否被挤掉由 conversation-column 的 minSize 决定。
+    maxSize: "100%",
     minSize: "240px",
     useResizablePanel: true,
   };

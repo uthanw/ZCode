@@ -271,6 +271,10 @@ export interface WorkspaceShellLayoutProps extends Omit<AppProps, "baseFeedbackS
   handleReopenClosedSidePaneTab: (tabId: string) => void;
   handleBrowserNavigationRequestHandled: (requestId: string) => void;
   setIsTerminalOpen: (open: boolean) => void;
+  /** 右侧面板被拖拽收起/展开时同步回 App（拖拽路径不走 handleToggleSidePane）。 */
+  setIsSidePaneCollapsed: (collapsed: boolean) => void;
+  /** 左侧栏被分隔条拖拽收起/展开时同步回 App。 */
+  setIsSidebarVisible: (visible: boolean) => void;
   setGitSelectedSourceId: (value: GitChangeSourceId) => void;
   taskFindDialogProps: TaskFindDialogProps;
 }

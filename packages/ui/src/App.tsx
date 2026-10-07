@@ -219,6 +219,7 @@ export function App({
     isSidePaneCollapsed,
     setIsSidePaneCollapsed,
     isSidebarVisible,
+    setIsSidebarVisible,
     browserNavigationRequest,
     setBrowserNavigationRequest,
     handleOpenCodeViewer,
@@ -1271,6 +1272,8 @@ export function App({
         handleReopenClosedSidePaneTab={handleReopenClosedSidePaneTab}
         handleBrowserNavigationRequestHandled={handleBrowserNavigationRequestHandled}
         setIsTerminalOpen={setIsTerminalOpen}
+        setIsSidePaneCollapsed={setIsSidePaneCollapsed}
+        setIsSidebarVisible={setIsSidebarVisible}
         setGitSelectedSourceId={setGitSelectedSourceId}
         // taskFindDialogProps 是对象 prop，内联创建会让 shell 在流式刷新中每轮都看到新引用。
         taskFindDialogProps={taskFindDialogProps}

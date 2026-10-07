@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import type { PointerEvent as ReactPointerEvent } from "react";
 import type { RefObject } from "react";
-import type { PanelImperativeHandle } from "react-resizable-panels";
+import type { PanelImperativeHandle, PanelSize } from "react-resizable-panels";
 import type { IServiceAccessor } from "@zcode/services";
 import { Terminal } from "@/Terminal.js";
 import { ScopedErrorBoundary } from "@/ErrorBoundary.js";
@@ -20,6 +20,7 @@ export function AnimatedTerminalPanel({
   panelElementRef,
   onClose,
   onOpenBrowserUrl,
+  onResize,
 }: {
   services: IServiceAccessor;
   workspaceAbsPath: string;
@@ -32,11 +33,11 @@ export function AnimatedTerminalPanel({
   panelElementRef: RefObject<HTMLDivElement | null>;
   onClose: () => void;
   onOpenBrowserUrl: (url: string) => void;
+  /** 用户把面板拖到收起 / 从收起态拖出来时回调，用于把面板状态同步回 App。 */
+  onResize?: (panelSize: PanelSize) => void;
 }) {
   const [hasRenderedTerminal, setHasRenderedTerminal] = useState(isVisible);
   const [isTerminalPanelResizing, setIsTerminalPanelResizing] = useState(false);
-  const isDragCollapsible = !isVisible;
-  const isResizeDisabled = !isVisible;
   const workspaceKey = workspaceIdentity?.trim() || workspaceAbsPath;
 
   const finishTerminalPanelResize = useCallback(() => {
@@ -88,32 +89,33 @@ export function AnimatedTerminalPanel({
 
   return (
     <>
-      {isVisible ? (
-        <ResizableHandle
-          data-workspace-terminal-resize-handle="true"
-          className={cn(
-            "aria-[orientation=horizontal]:h-1 aria-[orientation=horizontal]:w-full aria-[orientation=horizontal]:mx-0 aria-[orientation=horizontal]:translate-y-0 aria-[orientation=horizontal]:[mask-image:none] aria-[orientation=horizontal]:[-webkit-mask-image:none] hover:bg-transparent data-[separator=hover]:bg-transparent data-[separator=active]:bg-transparent focus-visible:bg-transparent after:pointer-events-none after:absolute after:rounded-full after:bg-foreground-subtlest/50 after:opacity-0 after:transition-opacity after:content-[''] after:inset-x-[var(--workspace-panel-radius,var(--radius-xl))] after:h-0.5 hover:after:opacity-100 data-[separator=hover]:after:opacity-100 data-[separator=active]:after:opacity-100 focus-visible:after:opacity-100",
-            isTerminalPanelResizing && "after:opacity-100",
-          )}
-          onPointerCancel={finishTerminalPanelResize}
-          onPointerDown={handleTerminalPanelResizeStart}
-          onPointerUp={finishTerminalPanelResize}
-        />
-      ) : null}
+      {/* 分隔条常驻：终端收起后它仍留在栏底，用户按住往上拖就能把终端拉出来，
+          这正是 VS Code 的收起/恢复方式。之前按 isVisible 卸载分隔条，一旦拖到收起
+          就没有任何可抓的热区，面板再也拉不回来。 */}
+      <ResizableHandle
+        data-workspace-terminal-resize-handle="true"
+        className={cn(
+          "aria-[orientation=horizontal]:h-1 aria-[orientation=horizontal]:w-full aria-[orientation=horizontal]:mx-0 aria-[orientation=horizontal]:translate-y-0 aria-[orientation=horizontal]:[mask-image:none] aria-[orientation=horizontal]:[-webkit-mask-image:none] hover:bg-transparent data-[separator=hover]:bg-transparent data-[separator=active]:bg-transparent focus-visible:bg-transparent after:pointer-events-none after:absolute after:rounded-full after:bg-foreground-subtlest/50 after:opacity-0 after:transition-opacity after:content-[''] after:inset-x-[var(--workspace-panel-radius,var(--radius-xl))] after:h-0.5 hover:after:opacity-100 data-[separator=hover]:after:opacity-100 data-[separator=active]:after:opacity-100 focus-visible:after:opacity-100",
+          isTerminalPanelResizing && "after:opacity-100",
+        )}
+        onPointerCancel={finishTerminalPanelResize}
+        onPointerDown={handleTerminalPanelResizeStart}
+        onPointerUp={finishTerminalPanelResize}
+      />
       <ResizablePanel
         id="terminal"
         panelRef={panelRef}
         elementRef={panelElementRef}
         defaultSize="0px"
         minSize="140px"
-        maxSize="50%"
+        // 上限从 50% 放宽到 100%：上限卡在 50% 时，用户没法把聊天区完全折叠、
+        // 让终端独占主区域。真正防止「拖到最小就自动收起」的是下面的 collapsible 语义。
+        maxSize="100%"
         collapsedSize="0px"
-        // 终端面板之前拖到最小高度就会直接进入 collapsed，和手动关闭共用了同一触发条件。
-        // 这里只在显式关闭终端时允许折叠，保留原有开关动画，同时去掉“拖到最小自动收起”。
-        collapsible={isDragCollapsible}
-        // 收起后虽然不渲染 ResizableHandle，库仍会把 collapsed panel 边缘当成可拖拽热区。
-        // 禁用隐藏终端面板的 resize target，避免用户从边缘把 terminal 拖出来。
-        disabled={isResizeDisabled}
+        // 常驻 collapsible：拖到 minSize 以下会像 VS Code 一样吸附收起，
+        // 收起后继续把分隔条往外拖就能重新拉出来（库内建的行为）。
+        collapsible
+        onResize={onResize}
         className={cn(
           "transition-opacity duration-200 ease-out",
           isVisible ? "opacity-100" : "pointer-events-none opacity-0",

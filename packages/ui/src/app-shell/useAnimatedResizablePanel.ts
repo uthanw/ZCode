@@ -1,8 +1,11 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { PanelImperativeHandle } from "react-resizable-panels";
 
 const PANEL_FLEX_GROW_TRANSITION_CLASSES = ["transition-[flex-grow]", "duration-200", "ease-out"];
 const PANEL_FLEX_GROW_TRANSITION_FALLBACK_MS = 240;
+// 记住展开尺寸时忽略接近 0 的百分比：拖到收起的那一帧 getSize() 会读到 0.x%，
+// 若把它记成“上次展开尺寸”，用户下次点开关展开出来就是一条缝。
+const PANEL_SIZE_REMEMBER_MIN_PERCENTAGE = 2;
 
 function enablePanelFlexGrowTransition(panelElement: HTMLElement): () => void {
   panelElement.classList.add(...PANEL_FLEX_GROW_TRANSITION_CLASSES);
@@ -40,18 +43,87 @@ export function useAnimatedResizablePanel({
   expandedSize,
   rememberExpandedSize = false,
   resizeOnInitialVisibleMount = true,
+  onUserCollapseChange,
 }: {
   open: boolean;
   alwaysMounted?: boolean;
   expandedSize?: string;
   rememberExpandedSize?: boolean;
   resizeOnInitialVisibleMount?: boolean;
+  /**
+   * 用户把面板拖到收起、或从收起态拖出来时回调。
+   *
+   * 库没有 onCollapse/onExpand，只能在 onResize 里用 isCollapsed() 反推；
+   * 而程序化收起（点开关、窗口 resize 触发自动收起、切视图）同样会走 onResize，
+   * 所以这里用“指针是否按在 PanelGroup 内”把用户拖拽和程序化变更分开，只同步前者。
+   */
+  onUserCollapseChange?: (collapsed: boolean) => void;
 }) {
   const panelRef = useRef<PanelImperativeHandle | null>(null);
   const panelElementRef = useRef<HTMLDivElement | null>(null);
   const expandedSizeRef = useRef(expandedSize);
   const hasHandledVisibilityRef = useRef(false);
   const [isVisible, setIsVisible] = useState(open);
+  const openRef = useRef(open);
+  openRef.current = open;
+  const onUserCollapseChangeRef = useRef(onUserCollapseChange);
+  onUserCollapseChangeRef.current = onUserCollapseChange;
+  // 拖拽中标记：pointerup 之后再放两帧，让拖拽最后一拍产生的 ResizeObserver
+  // 回调仍被判定成“用户拖拽”，否则松手瞬间的收起/展开会漏同步。
+  const isPointerDownOnGroupRef = useRef(false);
+  const pointerUpFrameRef = useRef(0);
+
+  useEffect(() => {
+    const resolveGroupElement = () => panelElementRef.current?.parentElement ?? null;
+
+    const handlePointerDown = (event: PointerEvent) => {
+      const groupElement = resolveGroupElement();
+      if (!groupElement || !(event.target instanceof Node) || !groupElement.contains(event.target)) {
+        return;
+      }
+      if (pointerUpFrameRef.current) {
+        window.cancelAnimationFrame(pointerUpFrameRef.current);
+        pointerUpFrameRef.current = 0;
+      }
+      isPointerDownOnGroupRef.current = true;
+    };
+
+    const handlePointerUp = () => {
+      if (pointerUpFrameRef.current) {
+        window.cancelAnimationFrame(pointerUpFrameRef.current);
+      }
+      pointerUpFrameRef.current = window.requestAnimationFrame(() => {
+        pointerUpFrameRef.current = window.requestAnimationFrame(() => {
+          pointerUpFrameRef.current = 0;
+          isPointerDownOnGroupRef.current = false;
+        });
+      });
+    };
+
+    window.addEventListener("pointerdown", handlePointerDown, true);
+    window.addEventListener("pointerup", handlePointerUp, true);
+    window.addEventListener("pointercancel", handlePointerUp, true);
+    return () => {
+      if (pointerUpFrameRef.current) {
+        window.cancelAnimationFrame(pointerUpFrameRef.current);
+        pointerUpFrameRef.current = 0;
+      }
+      window.removeEventListener("pointerdown", handlePointerDown, true);
+      window.removeEventListener("pointerup", handlePointerUp, true);
+      window.removeEventListener("pointercancel", handlePointerUp, true);
+    };
+  }, []);
+
+  const handlePanelResize = useCallback(() => {
+    if (!isPointerDownOnGroupRef.current) {
+      return;
+    }
+    const collapsed = panelRef.current?.isCollapsed() ?? false;
+    if (collapsed === !openRef.current) {
+      return;
+    }
+    onUserCollapseChangeRef.current?.(collapsed);
+  }, []);
 
   useEffect(() => {
     expandedSizeRef.current = expandedSize;
@@ -106,6 +178,11 @@ export function useAnimatedResizablePanel({
     // “Panel constraints not found” 崩溃。这里延后一帧，确保面板先完成注册再执行动画命令。
     const rafId = window.requestAnimationFrame(() => {
       if (isVisible) {
+        // 面板可能已经被用户从边缘直接拖出来了。这种情况下尺寸是用户当下的选择，
+        // 再 resize 到记住的百分比会把刚拖出的宽度顶回去；只在确实处于 collapsed 时才展开。
+        if (!panel.isCollapsed()) {
+          return;
+        }
         const nextExpandedSize = expandedSizeRef.current;
         if (nextExpandedSize) {
           panel.resize(nextExpandedSize);
@@ -116,7 +193,10 @@ export function useAnimatedResizablePanel({
       }
       if (rememberExpandedSize) {
         const currentSize = panel.getSize().asPercentage;
-        if (Number.isFinite(currentSize) && currentSize > 0) {
+        if (
+          Number.isFinite(currentSize) &&
+          currentSize >= PANEL_SIZE_REMEMBER_MIN_PERCENTAGE
+        ) {
           expandedSizeRef.current = `${currentSize}%`;
         }
       }
@@ -133,5 +213,6 @@ export function useAnimatedResizablePanel({
     panelRef,
     panelElementRef,
     isVisible,
+    handlePanelResize,
   };
 }

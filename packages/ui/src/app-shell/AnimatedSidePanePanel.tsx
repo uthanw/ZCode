@@ -1,7 +1,7 @@
 /* eslint-disable max-lines -- Side pane 当前集中承载 tabs、browser/git/code-viewer 内容；完整拆分需按 pane 功能边界继续推进。 */
 import { ServiceProvider } from "@/hooks/useServices.js";
 import { useEffect, useMemo, useRef, useState, type CSSProperties, type RefObject } from "react";
-import type { PanelImperativeHandle } from "react-resizable-panels";
+import type { PanelImperativeHandle, PanelSize } from "react-resizable-panels";
 import type { IServiceAccessor } from "@zcode/services";
 import {
   closestCenter,
@@ -336,6 +336,7 @@ export function AnimatedSidePanePanel({
   showWindowControls,
   onCloseSidePane,
   toggleSidePaneShortcutLabel,
+  onResize,
 }: {
   services: IServiceAccessor;
   frameClassName?: string;
@@ -400,12 +401,12 @@ export function AnimatedSidePanePanel({
   onBrowserUrlChange: (tabId: string, url: string) => void;
   onBrowserPageMetadataChange: (tabId: string, metadata: BrowserSidePaneMetadata) => void;
   onSelectGitSource: (value: GitChangeSourceId) => void;
+  /** 用户把面板拖到收起 / 从收起态拖出来时回调，用于把面板状态同步回 App。 */
+  onResize?: (panelSize: PanelSize) => void;
 }) {
   const { intl } = useZCodeIntl();
   const isOfficeMode = useIsOfficeMode();
   const developerToolsEnabled = useDeveloperToolsVisibility();
-  const isDragCollapsible = !isVisible;
-  const isResizeDisabled = !isVisible;
   const workspaceKey = workspaceIdentity?.trim() || workspaceAbsPath;
   const tabs = sidePaneState?.tabs ?? EMPTY_SIDE_PANE_TABS;
   const screenshotSurfaceRequest = screenshotSurfaceRequestProp;
@@ -1338,19 +1339,20 @@ export function AnimatedSidePanePanel({
 
   return (
     <>
-      {isVisible ? (
-        <ResizableHandle
-          data-workspace-side-pane-resize-handle="true"
-          className={cn(
-            // 拖动条占据真实 4px 间距，关闭时随 handle 一起移除，不为隐藏面板保留空隙。
-            "aria-[orientation=vertical]:w-1 aria-[orientation=vertical]:translate-x-0 aria-[orientation=vertical]:my-0 aria-[orientation=vertical]:h-full",
-            "hover:bg-transparent data-[separator=hover]:bg-transparent data-[separator=active]:bg-transparent focus-visible:bg-transparent",
-            "aria-[orientation=vertical]:[mask-image:none] aria-[orientation=vertical]:[-webkit-mask-image:none]",
-            "after:pointer-events-none after:absolute after:rounded-full after:bg-foreground-subtlest/50 after:opacity-0 after:transition-opacity after:content-[''] after:inset-y-[var(--workspace-panel-radius,var(--radius-xl))] after:w-0.5",
-            "hover:after:opacity-100 data-[separator=hover]:after:opacity-100 data-[separator=active]:after:opacity-100 focus-visible:after:opacity-100",
-          )}
-        />
-      ) : null}
+      {/* 分隔条常驻：折叠（浏览器标签全部关闭/拖到最小）后它仍留在右边缘，
+          用户按住往左拖就能把面板重新拉出来。之前按 isVisible 卸载分隔条，
+          折叠瞬间热区就消失了，面板再也拖不动——这正是用户报的「完全拖不动」。 */}
+      <ResizableHandle
+        data-workspace-side-pane-resize-handle="true"
+        className={cn(
+          // 拖动条占据真实 4px 间距，折叠时同样保留，作为拉出面板的抓取点。
+          "aria-[orientation=vertical]:w-1 aria-[orientation=vertical]:translate-x-0 aria-[orientation=vertical]:my-0 aria-[orientation=vertical]:h-full",
+          "hover:bg-transparent data-[separator=hover]:bg-transparent data-[separator=active]:bg-transparent focus-visible:bg-transparent",
+          "aria-[orientation=vertical]:[mask-image:none] aria-[orientation=vertical]:[-webkit-mask-image:none]",
+          "after:pointer-events-none after:absolute after:rounded-full after:bg-foreground-subtlest/50 after:opacity-0 after:transition-opacity after:content-[''] after:inset-y-[var(--workspace-panel-radius,var(--radius-xl))] after:w-0.5",
+          "hover:after:opacity-100 data-[separator=hover]:after:opacity-100 data-[separator=active]:after:opacity-100 focus-visible:after:opacity-100",
+        )}
+      />
       <ResizablePanel
         id="browser"
         panelRef={panelRef}
@@ -1359,12 +1361,10 @@ export function AnimatedSidePanePanel({
         minSize={panelLayout.minSize}
         maxSize={panelLayout.maxSize}
         collapsedSize={panelLayout.collapsedSize}
-        // 右侧面板常驻声明成 collapsible 时，拖到最小宽度会被库判定为 collapse。
-        // 这里改成只在显式关闭时允许折叠，避免用户只是想拖到最小宽度时面板自动收起。
-        collapsible={isDragCollapsible}
-        // preview/side pane 收起时没有 ResizableHandle，但库仍会暴露 collapsed panel 边缘拖拽区。
-        // 收起后禁用面板 resize target，避免用户绕过显式开关从右侧边缘拖出面板。
-        disabled={isResizeDisabled}
+        // 常驻 collapsible：拖到 minSize 以下会像 VS Code 一样吸附收起，
+        // 收起后继续把分隔条往外拖就能重新拉出来（库内建的行为）。
+        collapsible
+        onResize={onResize}
         className={cn(
           "!overflow-hidden transition-opacity duration-200 ease-out",
           // 截图期间 panel 仍保持 opacity=1，避免 opacity=0 让 Chromium 丢弃 guest

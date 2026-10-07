@@ -97,7 +97,12 @@ import { useZCodeSessionStore } from "@/store/zcodeSessionStore.js";
 import type { ComposerMentionPrefill } from "@/store/zcodeSessionStoreTypes.js";
 
 const WORKSPACE_SIDEBAR_DEFAULT_WIDTH_PX = 264;
-const WORKSPACE_SIDEBAR_MIN_WIDTH_PX = 264;
+// 下限从 264 放宽到 160：原来 264 是硬下限，拖到底也缩不动，做不到 VS Code 那种
+// 「一直拖就一直窄、窄到头就收起」。内容是弹性布局，160px 下仍然可用。
+const WORKSPACE_SIDEBAR_MIN_WIDTH_PX = 160;
+// 收起阈值就取最小宽度：拖到最小宽度即判定为「用户要收起」，
+// 两层之间不留死区（否则拖到下限还在展开、再拖一点也不动，手感很怪）。
+const WORKSPACE_SIDEBAR_COLLAPSE_THRESHOLD_PX = WORKSPACE_SIDEBAR_MIN_WIDTH_PX;
 const WORKSPACE_SIDEBAR_MAX_WIDTH_RATIO = 0.5;
 const WORKSPACE_SIDEBAR_WIDTH_STORAGE_KEY = "zcode:workspace-shell:sidebar-width-px";
 const LEGACY_WORKSPACE_SHELL_LAYOUT_STORAGE_KEY =
@@ -126,6 +131,8 @@ type WorkspaceSidebarResizeSession = {
   pointerId: number;
   startWidthPx: number;
   startX: number;
+  /** 当前这一拍是否已经越过「拖到收起」阈值。 */
+  collapsePending: boolean;
 };
 
 function clampWorkspaceSidebarWidth(widthPx: number, containerWidthPx?: number) {
@@ -138,6 +145,16 @@ function clampWorkspaceSidebarWidth(widthPx: number, containerWidthPx?: number) 
       : Number.POSITIVE_INFINITY;
 
   return Math.round(Math.max(WORKSPACE_SIDEBAR_MIN_WIDTH_PX, Math.min(widthPx, maxWidthPx)));
+}
+
+// 拖拽宽度本身可以直接持久化（用户拖到多窄就是多窄），但收起动画沿线会产生
+// 接近 0 的瞬时宽度；这些值一旦写进 localStorage，下次展开就会是一条缝。
+// 这里统一把「明显小于收起阈值」的值还原成默认宽度。
+function resolvePersistableWorkspaceSidebarWidthPx(widthPx: number) {
+  if (!Number.isFinite(widthPx) || widthPx <= WORKSPACE_SIDEBAR_COLLAPSE_THRESHOLD_PX) {
+    return WORKSPACE_SIDEBAR_DEFAULT_WIDTH_PX;
+  }
+  return Math.round(widthPx);
 }
 
 function readStoredWorkspaceSidebarWidthPx(): number | null {
@@ -181,7 +198,10 @@ function persistWorkspaceSidebarWidthPx(widthPx: number) {
   }
 
   try {
-    window.localStorage.setItem(WORKSPACE_SIDEBAR_WIDTH_STORAGE_KEY, String(Math.round(widthPx)));
+    window.localStorage.setItem(
+      WORKSPACE_SIDEBAR_WIDTH_STORAGE_KEY,
+      String(resolvePersistableWorkspaceSidebarWidthPx(widthPx)),
+    );
   } catch {
     // ignore
   }
@@ -330,6 +350,8 @@ export const WorkspaceShellLayout = memo(function WorkspaceShellLayoutComponent(
   handleReopenClosedSidePaneTab,
   handleBrowserNavigationRequestHandled,
   setIsTerminalOpen,
+  setIsSidePaneCollapsed,
+  setIsSidebarVisible,
   setGitSelectedSourceId,
   taskFindDialogProps,
 }: WorkspaceShellLayoutProps) {
@@ -383,11 +405,17 @@ export const WorkspaceShellLayout = memo(function WorkspaceShellLayoutComponent(
     workspaceKey,
   });
   const conversationAutoCollapseResizeTimerRef = useRef<number | null>(null);
+  // 最近一次已知的视口宽度。移动端软键盘只会改变高度，用它把「键盘弹起触发的
+  // window resize」和「用户真的改了窗口宽度」区分开，避免键盘一弹就自动收起侧栏。
+  const lastViewportWidthPxRef = useRef<number | null>(null);
   const workspaceSidebarResizeSessionRef = useRef<WorkspaceSidebarResizeSession | null>(null);
   const [workspaceSidebarPanelWidthPx, setWorkspaceSidebarPanelWidthPx] = useState(
     () => readStoredWorkspaceSidebarWidthPx() ?? WORKSPACE_SIDEBAR_DEFAULT_WIDTH_PX,
   );
   const workspaceSidebarPanelWidthPxRef = useRef(workspaceSidebarPanelWidthPx);
+  // 已提交（非拖拽瞬时）的展开宽度：拖到收起时用它还原 ref，
+  // 否则 ref 会停在那条几像素的瞬时宽度上，下次展开就从缝里开始。
+  const workspaceSidebarCommittedWidthPxRef = useRef(workspaceSidebarPanelWidthPx);
   const openWorkspaceKeys = useMemo(
     () => workspaceTabs.map((tab) => tab.workspaceIdentity?.trim() || tab.workspacePath),
     [workspaceTabs],
@@ -407,15 +435,20 @@ export const WorkspaceShellLayout = memo(function WorkspaceShellLayoutComponent(
     panelRef: terminalPanelRef,
     panelElementRef: terminalPanelElementRef,
     isVisible: isTerminalVisible,
+    handlePanelResize: handleTerminalPanelResize,
   } = useAnimatedResizablePanel({
     open: isTerminalOpen,
     expandedSize: "30%",
     rememberExpandedSize: true,
+    // 用户把终端分隔条拖到底 → 收起；再从底边拖出来 → 展开。
+    // 库没有 onCollapse，靠 onResize + isCollapsed() 反推，所以要把 setter 接回来。
+    onUserCollapseChange: (collapsed) => setIsTerminalOpen(!collapsed),
   });
   const {
     panelRef: sidePanePanelRef,
     panelElementRef: sidePanePanelElementRef,
     isVisible: isSidePaneVisible,
+    handlePanelResize: handleSidePanePanelResize,
   } = useAnimatedResizablePanel({
     // 截图 surface 由 browser-use tab 自己的 fixed 承载层提供尺寸，不能再把整个右侧
     // ResizablePanel 撑开；否则自动化页会闪出空白的 tab 栏，且面板过渡期间 guest surface
@@ -424,6 +457,8 @@ export const WorkspaceShellLayout = memo(function WorkspaceShellLayoutComponent(
     expandedSize: SIDE_PANE_DEFAULT_EXPANDED_SIZE,
     rememberExpandedSize: true,
     resizeOnInitialVisibleMount: false,
+    // 右侧面板同理：拖到左边收起、再往右拖出恢复。
+    onUserCollapseChange: (collapsed) => setIsSidePaneCollapsed(collapsed),
   });
   const workspaceSessionActionDisabled =
     Boolean(workspaceReadOnlyReason) || reloadSessionDisabled || reloadSessionPending;
@@ -509,6 +544,15 @@ export const WorkspaceShellLayout = memo(function WorkspaceShellLayoutComponent(
     };
 
     const handleWindowResize = () => {
+      // 移动端软键盘弹出/收起同样会触发 window resize（布局视口高度变化）。
+      // 之前只按 resize 事件走，键盘一弹就把侧栏误判成「对话过窄」自动收起来。
+      // 自动收起只关心真正的横向空间变化，这里用 innerWidth 变没变当作闸门。
+      const nextViewportWidthPx = window.innerWidth;
+      if (nextViewportWidthPx === lastViewportWidthPxRef.current) {
+        return;
+      }
+      lastViewportWidthPxRef.current = nextViewportWidthPx;
+
       if (conversationAutoCollapseResizeTimerRef.current !== null) {
         window.clearTimeout(conversationAutoCollapseResizeTimerRef.current);
       }
@@ -521,6 +565,7 @@ export const WorkspaceShellLayout = memo(function WorkspaceShellLayoutComponent(
       }, CONVERSATION_AUTO_COLLAPSE_RESIZE_IDLE_MS);
     };
 
+    lastViewportWidthPxRef.current = window.innerWidth;
     window.addEventListener("resize", handleWindowResize);
 
     return () => {
@@ -534,10 +579,15 @@ export const WorkspaceShellLayout = memo(function WorkspaceShellLayoutComponent(
 
   useEffect(() => {
     workspaceSidebarPanelWidthPxRef.current = workspaceSidebarPanelWidthPx;
+    // 拖拽期间不提交 state，所以这里只会被非拖拽路径（开关、键盘、迁移）触发；
+    // 它同时也是「展开态记忆宽度」的同步点。
+    if (!workspaceSidebarResizeSessionRef.current) {
+      workspaceSidebarCommittedWidthPxRef.current = workspaceSidebarPanelWidthPx;
+    }
   }, [workspaceSidebarPanelWidthPx]);
 
   const applyWorkspaceSidebarWidthDuringDrag = useCallback(
-    (nextWidthPx: number) => {
+    (nextWidthPx: number, visible: boolean) => {
       workspaceSidebarPanelWidthPxRef.current = nextWidthPx;
       const shellElement = workspaceShellRef.current;
       if (!shellElement) {
@@ -547,13 +597,15 @@ export const WorkspaceShellLayout = memo(function WorkspaceShellLayoutComponent(
       // 大会话 trace 显示拖拽侧栏时每个 pointermove 都 setState，
       // 会让 WorkspaceShellLayout、WorkspaceSidebar 和 ChatView 大树反复 render。
       // 拖拽中的宽度只是瞬时布局值，直接写 CSS 变量；释放时再提交 React state。
+      // visible 由调用方传入当前逻辑态：拖到收起的那一拍 isSidebarPanelVisible 还是旧值，
+      // 用闭包里的旧值会让收起动画卡在最后一帧宽度上。
       shellElement.style.setProperty(
         WORKSPACE_SIDEBAR_PANEL_WIDTH_CSS_VAR,
-        `${isSidebarPanelVisible ? nextWidthPx : collapsedSidebarWidthPx}px`,
+        `${visible ? nextWidthPx : collapsedSidebarWidthPx}px`,
       );
       shellElement.style.setProperty(WORKSPACE_SIDEBAR_WIDTH_CSS_VAR, `${nextWidthPx}px`);
     },
-    [collapsedSidebarWidthPx, isSidebarPanelVisible],
+    [collapsedSidebarWidthPx],
   );
 
   useEffect(() => {
@@ -602,7 +654,9 @@ export const WorkspaceShellLayout = memo(function WorkspaceShellLayoutComponent(
 
   const handleWorkspaceSidebarResizeStart = useCallback(
     (event: ReactPointerEvent<HTMLDivElement>) => {
-      if (!isSidebarPanelVisible || (event.pointerType === "mouse" && event.button !== 0)) {
+      // 不再要求侧栏可见才允许拖拽：收起后分隔条仍在，用户按住它往右拖就应该能把侧栏
+      // 重新拉出来（VS Code 的做法）。可见时从当前宽度起步，收起时从 0 起步。
+      if (event.pointerType === "mouse" && event.button !== 0) {
         return;
       }
 
@@ -615,8 +669,9 @@ export const WorkspaceShellLayout = memo(function WorkspaceShellLayoutComponent(
       workspaceSidebarResizeSessionRef.current = {
         containerWidthPx,
         pointerId: event.pointerId,
-        startWidthPx: workspaceSidebarPanelWidthPxRef.current,
+        startWidthPx: isSidebarPanelVisible ? workspaceSidebarPanelWidthPxRef.current : 0,
         startX: event.clientX,
+        collapsePending: !isSidebarPanelVisible,
       };
       setWorkspaceSidebarResizeActive({
         active: true,
@@ -641,10 +696,19 @@ export const WorkspaceShellLayout = memo(function WorkspaceShellLayoutComponent(
         resizeSession.startWidthPx + event.clientX - resizeSession.startX,
         resizeSession.containerWidthPx,
       );
-      applyWorkspaceSidebarWidthDuringDrag(nextWidthPx);
+
+      // 从收起态拖出：起点是 0，用户往右拖出多少就显示多少。
+      // 一旦越过收起阈值就切回展开态（淡入）。
+      const wasCollapsed = resizeSession.collapsePending;
+      const shouldCollapse = nextWidthPx <= WORKSPACE_SIDEBAR_COLLAPSE_THRESHOLD_PX;
+      if (shouldCollapse !== wasCollapsed) {
+        setIsSidebarVisible(!shouldCollapse);
+      }
+      resizeSession.collapsePending = shouldCollapse;
+      applyWorkspaceSidebarWidthDuringDrag(nextWidthPx, !shouldCollapse);
       event.currentTarget.setAttribute("aria-valuenow", String(Math.round(nextWidthPx)));
     },
-    [applyWorkspaceSidebarWidthDuringDrag],
+    [applyWorkspaceSidebarWidthDuringDrag, setIsSidebarVisible],
   );
 
   const finishWorkspaceSidebarResize = useCallback(
@@ -660,18 +724,31 @@ export const WorkspaceShellLayout = memo(function WorkspaceShellLayoutComponent(
         panelElement: workspaceSidebarPanelElementRef.current,
         shellElement: workspaceShellRef.current,
       });
-      setWorkspaceSidebarPanelWidthPx((currentWidthPx) => {
-        const finalWidthPx = workspaceSidebarPanelWidthPxRef.current;
-        return currentWidthPx === finalWidthPx ? currentWidthPx : finalWidthPx;
-      });
+
+      const finalWidthPx = workspaceSidebarPanelWidthPxRef.current;
+      const shouldStayCollapsed = resizeSession.collapsePending;
+      if (shouldStayCollapsed) {
+        // 拖到收起：ref 停留的那条瞬时宽度不是用户想要的展开宽度。
+        // 还原成会话开始时的记忆宽度，下次展开才不会从一条缝开始。
+        workspaceSidebarPanelWidthPxRef.current = workspaceSidebarCommittedWidthPxRef.current;
+        applyWorkspaceSidebarWidthDuringDrag(
+          workspaceSidebarCommittedWidthPxRef.current,
+          false,
+        );
+      } else {
+        workspaceSidebarCommittedWidthPxRef.current = finalWidthPx;
+        setWorkspaceSidebarPanelWidthPx((currentWidthPx) =>
+          currentWidthPx === finalWidthPx ? currentWidthPx : finalWidthPx,
+        );
+      }
       if (event.currentTarget.hasPointerCapture(event.pointerId)) {
         event.currentTarget.releasePointerCapture(event.pointerId);
       }
-      if (!cancelled) {
-        persistWorkspaceSidebarWidthPx(workspaceSidebarPanelWidthPxRef.current);
+      if (!cancelled && !shouldStayCollapsed) {
+        persistWorkspaceSidebarWidthPx(finalWidthPx);
       }
     },
-    [],
+    [applyWorkspaceSidebarWidthDuringDrag],
   );
 
   const handleWorkspaceSidebarResizeKeyDown = useCallback(
@@ -1480,6 +1557,7 @@ export const WorkspaceShellLayout = memo(function WorkspaceShellLayoutComponent(
       onBrowserUrlChange={handleBrowserUrlChange}
       onBrowserPageMetadataChange={handleBrowserPageMetadataChange}
       onSelectGitSource={setGitSelectedSourceId}
+      onResize={handleSidePanePanelResize}
     />
   );
   const sidePanePanel = renderSidePanePanel();
@@ -1608,29 +1686,30 @@ export const WorkspaceShellLayout = memo(function WorkspaceShellLayoutComponent(
           </aside>
         </div>
 
-        {isSidebarVisible ? (
-          <div
-            role="separator"
-            tabIndex={0}
-            aria-controls="sidebar"
-            aria-label={workspaceSidebarResizeLabel}
-            aria-orientation="vertical"
-            aria-valuemin={WORKSPACE_SIDEBAR_MIN_WIDTH_PX}
-            aria-valuenow={Math.round(workspaceSidebarPanelWidthPx)}
-            data-testid="resizable-handle"
-            onKeyDown={handleWorkspaceSidebarResizeKeyDown}
-            onPointerCancel={(event) => finishWorkspaceSidebarResize(event, true)}
-            onPointerDown={handleWorkspaceSidebarResizeStart}
-            onPointerMove={handleWorkspaceSidebarResizeMove}
-            onPointerUp={(event) => finishWorkspaceSidebarResize(event)}
-            className={cn(
-              "group/handle relative z-10 flex h-full w-1 shrink-0 touch-none cursor-ew-resize items-center justify-center bg-transparent outline-none [app-region:no-drag] focus:outline-none focus-visible:ring-0",
-              "after:pointer-events-none after:absolute after:rounded-full after:bg-foreground-subtlest/50 after:opacity-0 after:transition-opacity after:content-[''] after:inset-y-[var(--workspace-panel-radius)] after:w-0.5",
-              "hover:after:opacity-100 data-[separator=hover]:after:opacity-100 data-[separator=active]:after:opacity-100 focus-visible:after:opacity-100 [[data-workspace-sidebar-resizing=true]_&]:after:opacity-100",
-              hasDesktopPanelInset && "after:inset-y-[var(--workspace-resize-handle-inset)]",
-            )}
-          />
-        ) : null}
+        {/* 分隔条常驻：侧栏收起后它仍要留在左边缘，用户按住往右拖就能把侧栏拉回来，
+            这正是 VS Code 的收起/恢复方式，不需要额外的展开按钮。 */}
+        <div
+          role="separator"
+          tabIndex={0}
+          aria-controls="sidebar"
+          aria-label={workspaceSidebarResizeLabel}
+          aria-orientation="vertical"
+          aria-valuemin={WORKSPACE_SIDEBAR_MIN_WIDTH_PX}
+          aria-valuenow={Math.round(isSidebarPanelVisible ? workspaceSidebarPanelWidthPx : 0)}
+          aria-expanded={isSidebarPanelVisible}
+          data-testid="resizable-handle"
+          onKeyDown={handleWorkspaceSidebarResizeKeyDown}
+          onPointerCancel={(event) => finishWorkspaceSidebarResize(event, true)}
+          onPointerDown={handleWorkspaceSidebarResizeStart}
+          onPointerMove={handleWorkspaceSidebarResizeMove}
+          onPointerUp={(event) => finishWorkspaceSidebarResize(event)}
+          className={cn(
+            "group/handle relative z-10 flex h-full w-1 shrink-0 touch-none cursor-ew-resize items-center justify-center bg-transparent outline-none [app-region:no-drag] focus:outline-none focus-visible:ring-0",
+            "after:pointer-events-none after:absolute after:rounded-full after:bg-foreground-subtlest/50 after:opacity-0 after:transition-opacity after:content-[''] after:inset-y-[var(--workspace-panel-radius)] after:w-0.5",
+            "hover:after:opacity-100 data-[separator=hover]:after:opacity-100 data-[separator=active]:after:opacity-100 focus-visible:after:opacity-100 [[data-workspace-sidebar-resizing=true]_&]:after:opacity-100",
+            hasDesktopPanelInset && "after:inset-y-[var(--workspace-resize-handle-inset)]",
+          )}
+        />
         {/* 右侧主工作区：上方 header，下面左侧会话+终端，右侧共享 browser/code-viewer 槽位 */}
         <div
           data-panel=""
@@ -1652,7 +1731,15 @@ export const WorkspaceShellLayout = memo(function WorkspaceShellLayoutComponent(
           >
             <ResizablePanel
               id="conversation-column"
-              minSize="35%"
+              // 下限从 35% 放宽到 10%：35% 时右侧面板最多只能占到 65%，
+              // 用户没法把聊天区挤到边上、让右侧面板接近独占主区域。
+              // collapsible + collapsedSize 0：继续往右拖过一半下限（5%）就吸附收起，
+              // 聊天区完全让位给右侧面板；收起后把分隔条往回拖能连续拉出（库内建语义）。
+              // 这里是百分比下限，窗口 resize 只做等比缩放不会跨过收起中点，
+              // 所以不存在「窗口变小把聊天区自动收掉」的问题。
+              minSize="10%"
+              collapsible
+              collapsedSize="0px"
               defaultSize={isSidePaneVisible ? "52%" : undefined}
             >
               <ResizablePanelGroup
@@ -1664,7 +1751,12 @@ export const WorkspaceShellLayout = memo(function WorkspaceShellLayoutComponent(
                 <ResizablePanel
                   id="conversation"
                   elementRef={conversationPanelElementRef}
-                  minSize="35%"
+                  // 同上：下限放宽，让终端能往上顶到接近整屏。
+                  // collapsible + collapsedSize 0 让「把终端拉到接近满高」成为可能：
+                  // 拖过一半下限就吸附收起聊天区，再拖回来是连续的。
+                  minSize="10%"
+                  collapsible
+                  collapsedSize="0px"
                 >
                   <section
                     data-workspace-conversation-frame="true"
@@ -1925,6 +2017,7 @@ export const WorkspaceShellLayout = memo(function WorkspaceShellLayoutComponent(
                     panelElementRef={terminalPanelElementRef}
                     onClose={() => setIsTerminalOpen(false)}
                     onOpenBrowserUrl={handleOpenBrowserUrl}
+                    onResize={handleTerminalPanelResize}
                   />
                 ) : null}
               </ResizablePanelGroup>
