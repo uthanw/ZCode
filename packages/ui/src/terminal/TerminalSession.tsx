@@ -28,6 +28,15 @@ import {
   type TerminalInputFallbackHandledData,
 } from "@/terminal/terminalComposedInputFallback.js";
 import { normalizePowerShellReadlineRedraw } from "@/terminal/terminalDataTransform.js";
+
+import { installTerminalTouchScroll } from "@/terminal/terminalTouchScroll.js";
+import {
+  applyStickyCtrlToInputData,
+  consumeStickyCtrl,
+  hardenTerminalTextarea,
+  isStickyCtrlActive,
+  noteTerminalOutput,
+} from "@/terminal/terminalExtraKeys.js";
 import { getHttpLinksForTerminalBufferLine } from "@/terminal/terminalLinks.js";
 import { mergeTerminalTheme } from "@/terminal/terminalTheme.js";
 import {
@@ -319,6 +328,12 @@ export function TerminalSession({
   }, [isVisible, requestFocus, scheduleFitAndResize]);
 
   useEffect(() => {
+    // 移动端触摸滚动兜底只需装一次（内部幂等去重）；工作区终端与 side pane
+    // 终端都经本组件挂载，在这里统一接管。
+    return installTerminalTouchScroll();
+  }, []);
+
+  useEffect(() => {
     const wasResizing = isPanelResizingRef.current;
     isPanelResizingRef.current = isPanelResizing;
     if (wasResizing && !isPanelResizing && isVisibleRef.current) {
@@ -414,6 +429,7 @@ export function TerminalSession({
       term.loadAddon(fitAddon);
       term.loadAddon(new ClipboardAddon());
       term.open(hostEl);
+      hardenTerminalTextarea(term);
 
       let initialTerminalSize: TerminalSize | null = null;
       if (isVisibleRef.current && hostEl.clientWidth > 0 && hostEl.clientHeight > 0) {
@@ -438,6 +454,17 @@ export function TerminalSession({
       // 组件局部：customKeyEventHandler（依赖组件 inputFallback ref）
       term.attachCustomKeyEventHandler((e) => {
         if (e.type !== "keydown") return true;
+        // Termux 式粘滞 Ctrl：小屏补全按键栏激活后，下一个软键盘可打印键
+        // 按 Ctrl 组合发送（如 Ctrl+C 中断）。桌面真实 Ctrl 键自带 e.ctrlKey，不走这里。
+        if (isStickyCtrlActive() && !e.ctrlKey && e.key.length === 1) {
+          consumeStickyCtrl();
+          // 必须取消默认行为：否则浏览器继续产生 beforeinput/input，应用的
+          // 组合输入兜底会把它当作 IME 文本再写一次 PTY（Ctrl+C 变成 "^C"+"c"）。
+          e.preventDefault();
+          e.stopPropagation();
+          term.input(String.fromCharCode(e.key.charCodeAt(0) & 0x1f));
+          return false;
+        }
         inputFallbackKeydownCandidateRef.current =
           e.metaKey || e.ctrlKey || e.altKey
             ? null
@@ -586,6 +613,7 @@ export function TerminalSession({
           // data 订阅 → term.write（进 registry，detached 时仍累积 scrollback）
           registryDisposers.push(
             services.terminalService.onDynamicData(id)((data) => {
+              noteTerminalOutput(term, data);
               term.write(normalizePowerShellReadlineRedraw(data, shell));
             }),
           );
@@ -619,7 +647,10 @@ export function TerminalSession({
           // Shift 切换是输入法系统级行为（customKeyEventHandler 对 Shift 直接 return true 放行）；
           // 「Shift 切英文后字符丢失」的真根因是 isWindowsDesktop 未透传（已在 WorkspaceShellLayout 修复）。
           registryDisposers.push(
-            term.onData((data) => {
+            term.onData((rawData) => {
+              // 粘滞 Ctrl 统一漏斗：Android 软键盘走 composition、不发标准 keydown，
+              // 只有 onData 能覆盖全部输入路径（keydown/组合输入/粘贴）。
+              const data = applyStickyCtrlToInputData(rawData);
               const now = performance.now();
               const inputFallbackKeydownCandidate = inputFallbackKeydownCandidateRef.current;
               const handledData = recordTerminalInputFallbackHandledData({
@@ -781,6 +812,7 @@ export function TerminalSession({
     // 接入 ClipboardAddon 以支持 OSC 52，并让 xterm 的 copy 事件把选区写入系统剪贴板。
     term.loadAddon(new ClipboardAddon());
     term.open(el);
+    hardenTerminalTextarea(term);
     let initialTerminalSize: TerminalSize | null = null;
     if (isVisibleRef.current && el.clientWidth > 0 && el.clientHeight > 0) {
       try {
@@ -809,6 +841,15 @@ export function TerminalSession({
     // - Ctrl+V 不拦截会被当作 `^V` 字符输入。
     term.attachCustomKeyEventHandler((e) => {
       if (e.type !== "keydown") return true;
+      // 与上方 persistentKey 路径一致：粘滞 Ctrl 激活时软键盘可打印键转 Ctrl 组合。
+      if (isStickyCtrlActive() && !e.ctrlKey && e.key.length === 1) {
+        consumeStickyCtrl();
+        // 同上方 persistentKey 路径：取消默认行为，避免组合输入兜底重复写入。
+        e.preventDefault();
+        e.stopPropagation();
+        term.input(String.fromCharCode(e.key.charCodeAt(0) & 0x1f));
+        return false;
+      }
       inputFallbackKeydownCandidateRef.current =
         e.metaKey || e.ctrlKey || e.altKey
           ? null
@@ -921,6 +962,7 @@ export function TerminalSession({
 
         disposables.push(
           terminalService.onDynamicData(id)((data) => {
+            noteTerminalOutput(term, data);
             term.write(normalizePowerShellReadlineRedraw(data, shell));
           }),
         );
@@ -945,7 +987,10 @@ export function TerminalSession({
         );
 
         disposables.push(
-          term.onData((data) => {
+          term.onData((rawData) => {
+            // 与 persistentKey 路径一致：粘滞 Ctrl 在 onData 漏斗上统一应用，
+            // 覆盖软键盘 composition 等不产生标准 keydown 的输入模型。
+            const data = applyStickyCtrlToInputData(rawData);
             const now = performance.now();
             const inputFallbackKeydownCandidate = inputFallbackKeydownCandidateRef.current;
             const handledData = recordTerminalInputFallbackHandledData({

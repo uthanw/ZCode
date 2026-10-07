@@ -785,8 +785,14 @@ body {
  * xterm 自己的 viewport 会吃到全局滚动条样式，在终端右侧露出一条独立滚动条。
  * 终端滚动仍交给 xterm 内部处理，这里只隐藏原生滚动条，避免终端面板出现额外视觉噪音。
  */
-.terminal-xterm-shell .xterm-viewport {
+.terminal-xterm-shell {
   scrollbar-width: none;
+
+  /* 触摸设备：把终端内起手的滑动整体划给终端自身。终端嵌在可滚动的聊天列里，
+   * 不声明归属的话，真机浏览器的手势仲裁会在起手几像素内把原生滚动抢给祖先
+   * 容器（聊天时间线）并打断触摸事件流，表现为「终端滑动没有传递」。
+   * 滚动改由 terminalTouchScroll.ts 的 JS 接管，桌面端鼠标滚轮不受影响。 */
+  touch-action: none;
 }
 
 .terminal-xterm-shell .xterm-viewport::-webkit-scrollbar {

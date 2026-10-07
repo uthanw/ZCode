@@ -1,6 +1,7 @@
-import { useCallback } from "react";
+import { useCallback, useRef } from "react";
 import type { IServiceAccessor } from "@zcode/services";
 import { TerminalSession } from "@/terminal/TerminalSession.js";
+import { TerminalExtraKeysBar } from "@/terminal/TerminalExtraKeysBar.js";
 
 export function SidePaneTerminalPane({
   services,
@@ -33,19 +34,27 @@ export function SidePaneTerminalPane({
     // 不再显示或同步第二层 terminal tab 标题，避免形成嵌套 tabs。
   }, []);
 
+  const sectionRef = useRef<HTMLElement | null>(null);
+
   return (
-    <section className="h-full min-h-0 overflow-hidden bg-background p-3">
-      <TerminalSession
-        sessionId={sessionId}
-        persistentKey={sessionId}
-        workspaceKey={workspaceKey}
-        services={services}
-        cwd={cwd}
-        isVisible={isVisible}
-        isWindowsDesktop={isWindowsDesktop}
-        onShellLabelChange={handleShellLabelChange}
-        onOpenBrowserUrl={onOpenBrowserUrl}
-      />
+    <section
+      ref={sectionRef}
+      className="flex h-full min-h-0 flex-col overflow-hidden bg-background p-3"
+    >
+      <div className="min-h-0 flex-1">
+        <TerminalSession
+          sessionId={sessionId}
+          persistentKey={sessionId}
+          workspaceKey={workspaceKey}
+          services={services}
+          cwd={cwd}
+          isVisible={isVisible}
+          isWindowsDesktop={isWindowsDesktop}
+          onShellLabelChange={handleShellLabelChange}
+          onOpenBrowserUrl={onOpenBrowserUrl}
+        />
+      </div>
+      <TerminalExtraKeysBar getContainer={() => sectionRef.current} />
     </section>
   );
 }

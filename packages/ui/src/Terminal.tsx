@@ -7,6 +7,7 @@ import { useIsOfficeMode } from "@/hooks/useInterfaceMode.js";
 import { logger } from "@/logger.js";
 import { Button } from "@/components/ui/button.js";
 import { Tabs, TabsContent, TabsList } from "@/components/ui/tabs.js";
+import { TerminalExtraKeysBar } from "@/terminal/TerminalExtraKeysBar.js";
 import { getPathLeaf } from "@/lib/path.js";
 import { TerminalTabTrigger } from "@/terminal/TerminalTabTrigger.js";
 import { TerminalSession } from "@/terminal/TerminalSession.js";
@@ -63,6 +64,7 @@ export function Terminal({
     };
   });
   const closePanelAfterExitWorkspaceRef = useRef<string | null>(null);
+  const terminalSectionRef = useRef<HTMLElement | null>(null);
 
   useEffect(() => {
     if (!isVisible) {
@@ -288,6 +290,7 @@ export function Terminal({
   // 这样 workspace/task 切换或面板收起都不会中断正在运行的命令。
   return (
     <section
+      ref={terminalSectionRef}
       data-testid={TID_TERMINAL}
       className="flex h-full min-h-0 flex-col gap-2 overflow-hidden bg-background p-3 pb-2"
     >
@@ -382,6 +385,9 @@ export function Terminal({
           ))}
         </div>
       </Tabs>
+
+      {/* 小屏/触屏时的 Termux 式补全按键栏（软键盘没有 Esc/Ctrl/方向键） */}
+      <TerminalExtraKeysBar getContainer={() => terminalSectionRef.current} />
     </section>
   );
 }
