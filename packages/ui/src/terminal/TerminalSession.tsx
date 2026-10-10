@@ -1033,95 +1033,95 @@ export function TerminalSession({
         }),
       );
 
-        disposables.push(
-          term.onData((rawData) => {
-            // 与 persistentKey 路径一致：粘滞 Ctrl / Shift 在 onData 漏斗上统一应用，
-            // 覆盖软键盘 composition 等不产生标准 keydown 的输入模型。
-            const data = applyStickyShiftToInputData(applyStickyCtrlToInputData(rawData));
-            const now = performance.now();
-            const inputFallbackKeydownCandidate = inputFallbackKeydownCandidateRef.current;
-            const handledData = recordTerminalInputFallbackHandledData({
-              candidate: inputFallbackKeydownCandidate,
-              data,
-              history: recentInputFallbackHandledDataRef.current,
-              maxAgeMs: TERMINAL_INPUT_FALLBACK_RECENT_DATA_MS,
-              now,
-            });
-            recentInputFallbackHandledDataRef.current = handledData.usedCandidate
-              ? handledData.history
-              : recordTerminalInputFallbackRecentData({
-                  data,
-                  history: handledData.history,
-                  maxAgeMs: TERMINAL_INPUT_FALLBACK_RECENT_DATA_MS,
-                  now,
-                });
-            if (handledData.usedCandidate) {
-              inputFallbackKeydownCandidateRef.current = null;
-            }
-            markTerminalInputFallbackHandled(pendingInputFallbacksRef.current, data);
-            terminalService.write({ id, data });
-          }),
-        );
-
-        // Windows desktop 下某些输入法会把 composed text 留在 textarea 里，
-        // xterm 可能只处理到一半；这里保留兜底。但 Linux Wayland 已确认会和 xterm 的
-        // onData 路径重复写入，所以必须显式收窄到 Windows，避免把正常链路误伤。
-        const textarea =
-          isWindowsDesktop &&
-          (term as unknown as { _core: { textarea: HTMLTextAreaElement } })._core?.textarea;
-        if (textarea) {
-          const handleInput = (e: InputEvent) => {
-            // 只处理组合文本的 insertText
-            if (e.inputType !== "insertText" || !e.data || !e.composed) return;
-            const insertedText = e.data;
-            const now = performance.now();
-            const pendingFallback = createPendingTerminalInputFallback(insertedText);
-            pendingInputFallbacksRef.current.push(pendingFallback);
-            // 普通空格会先经 keydown 被 xterm onData 写入 PTY，随后浏览器才派发 composed input。
-            // 搜狗输入法也会在没有稳定 keydown candidate 的情况下先触发 xterm onData、后触发 composed input。
-            // 这里消费同一次输入附近的未消费 onData，避免把同一段组合文本再兜底写入一次。
-            consumeTerminalInputFallbackHandledData({
-              history: recentInputFallbackHandledDataRef.current,
-              inputEventTimeStamp: e.timeStamp,
-              maxAgeMs: TERMINAL_INPUT_FALLBACK_RECENT_DATA_MS,
-              maxInputDelayMs: TERMINAL_INPUT_FALLBACK_KEYDOWN_INPUT_MS,
-              now,
-              pending: pendingFallback,
-            });
-
-            // 延迟检查：等 xterm 的 onData 先认领 pending，再判断是否需要兜底写入。
-            setTimeout(() => {
-              pendingInputFallbacksRef.current = pendingInputFallbacksRef.current.filter(
-                (item) => item !== pendingFallback,
-              );
-              if (disposed) {
-                return;
-              }
-              const fallbackAction = resolveTerminalInputFallbackAction({
-                pending: pendingFallback,
-                textareaValue: textarea.value,
+      disposables.push(
+        term.onData((rawData) => {
+          // 与 persistentKey 路径一致：粘滞 Ctrl / Shift 在 onData 漏斗上统一应用，
+          // 覆盖软键盘 composition 等不产生标准 keydown 的输入模型。
+          const data = applyStickyShiftToInputData(applyStickyCtrlToInputData(rawData));
+          const now = performance.now();
+          const inputFallbackKeydownCandidate = inputFallbackKeydownCandidateRef.current;
+          const handledData = recordTerminalInputFallbackHandledData({
+            candidate: inputFallbackKeydownCandidate,
+            data,
+            history: recentInputFallbackHandledDataRef.current,
+            maxAgeMs: TERMINAL_INPUT_FALLBACK_RECENT_DATA_MS,
+            now,
+          });
+          recentInputFallbackHandledDataRef.current = handledData.usedCandidate
+            ? handledData.history
+            : recordTerminalInputFallbackRecentData({
+                data,
+                history: handledData.history,
+                maxAgeMs: TERMINAL_INPUT_FALLBACK_RECENT_DATA_MS,
+                now,
               });
-              if (fallbackAction.shouldWrite) {
-                // 普通空格也会触发 composed input，且 xterm 已经通过 onData 写入 PTY。
-                // 只看 textarea.value 会把空格再手动写一次；这里必须确认 onData 没处理过才兜底。
-                logger.debug("[Terminal] flush composed input fallback", {
-                  length: insertedText.length,
-                  terminalId: id,
-                  terminalTabId: sessionId,
-                });
-                terminalService.write({ id, data: insertedText });
-              }
-              if (fallbackAction.shouldClearTextarea) {
-                textarea.value = "";
-              }
-            }, TERMINAL_INPUT_FALLBACK_FLUSH_DELAY_MS);
-          };
+          if (handledData.usedCandidate) {
+            inputFallbackKeydownCandidateRef.current = null;
+          }
+          markTerminalInputFallbackHandled(pendingInputFallbacksRef.current, data);
+          terminalService.write({ id, data });
+        }),
+      );
 
-          textarea.addEventListener("input", handleInput, true);
-          disposables.push({
-            dispose: () => textarea.removeEventListener("input", handleInput, true),
-          } as IDisposable);
-        }
+      // Windows desktop 下某些输入法会把 composed text 留在 textarea 里，
+      // xterm 可能只处理到一半；这里保留兜底。但 Linux Wayland 已确认会和 xterm 的
+      // onData 路径重复写入，所以必须显式收窄到 Windows，避免把正常链路误伤。
+      const textarea =
+        isWindowsDesktop &&
+        (term as unknown as { _core: { textarea: HTMLTextAreaElement } })._core?.textarea;
+      if (textarea) {
+        const handleInput = (e: InputEvent) => {
+          // 只处理组合文本的 insertText
+          if (e.inputType !== "insertText" || !e.data || !e.composed) return;
+          const insertedText = e.data;
+          const now = performance.now();
+          const pendingFallback = createPendingTerminalInputFallback(insertedText);
+          pendingInputFallbacksRef.current.push(pendingFallback);
+          // 普通空格会先经 keydown 被 xterm onData 写入 PTY，随后浏览器才派发 composed input。
+          // 搜狗输入法也会在没有稳定 keydown candidate 的情况下先触发 xterm onData、后触发 composed input。
+          // 这里消费同一次输入附近的未消费 onData，避免把同一段组合文本再兜底写入一次。
+          consumeTerminalInputFallbackHandledData({
+            history: recentInputFallbackHandledDataRef.current,
+            inputEventTimeStamp: e.timeStamp,
+            maxAgeMs: TERMINAL_INPUT_FALLBACK_RECENT_DATA_MS,
+            maxInputDelayMs: TERMINAL_INPUT_FALLBACK_KEYDOWN_INPUT_MS,
+            now,
+            pending: pendingFallback,
+          });
+
+          // 延迟检查：等 xterm 的 onData 先认领 pending，再判断是否需要兜底写入。
+          setTimeout(() => {
+            pendingInputFallbacksRef.current = pendingInputFallbacksRef.current.filter(
+              (item) => item !== pendingFallback,
+            );
+            if (disposed) {
+              return;
+            }
+            const fallbackAction = resolveTerminalInputFallbackAction({
+              pending: pendingFallback,
+              textareaValue: textarea.value,
+            });
+            if (fallbackAction.shouldWrite) {
+              // 普通空格也会触发 composed input，且 xterm 已经通过 onData 写入 PTY。
+              // 只看 textarea.value 会把空格再手动写一次；这里必须确认 onData 没处理过才兜底。
+              logger.debug("[Terminal] flush composed input fallback", {
+                length: insertedText.length,
+                terminalId: id,
+                terminalTabId: sessionId,
+              });
+              terminalService.write({ id, data: insertedText });
+            }
+            if (fallbackAction.shouldClearTextarea) {
+              textarea.value = "";
+            }
+          }, TERMINAL_INPUT_FALLBACK_FLUSH_DELAY_MS);
+        };
+
+        textarea.addEventListener("input", handleInput, true);
+        disposables.push({
+          dispose: () => textarea.removeEventListener("input", handleInput, true),
+        } as IDisposable);
+      }
     };
 
     // 刷新恢复：优先重连 localStorage 记录的服务端 PTY（服务端在客户端断连时按设计不回收 pty），

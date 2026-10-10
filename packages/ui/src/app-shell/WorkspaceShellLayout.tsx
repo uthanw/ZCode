@@ -731,10 +731,7 @@ export const WorkspaceShellLayout = memo(function WorkspaceShellLayoutComponent(
         // 拖到收起：ref 停留的那条瞬时宽度不是用户想要的展开宽度。
         // 还原成会话开始时的记忆宽度，下次展开才不会从一条缝开始。
         workspaceSidebarPanelWidthPxRef.current = workspaceSidebarCommittedWidthPxRef.current;
-        applyWorkspaceSidebarWidthDuringDrag(
-          workspaceSidebarCommittedWidthPxRef.current,
-          false,
-        );
+        applyWorkspaceSidebarWidthDuringDrag(workspaceSidebarCommittedWidthPxRef.current, false);
       } else {
         workspaceSidebarCommittedWidthPxRef.current = finalWidthPx;
         setWorkspaceSidebarPanelWidthPx((currentWidthPx) =>

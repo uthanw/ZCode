@@ -121,8 +121,14 @@ const onTouchMove = (event: TouchEvent) => {
     const rect = shell.getBoundingClientRect();
     const cols = Math.max(1, term.cols);
     const rows = Math.max(1, term.rows);
-    const cx = Math.min(cols, Math.max(1, Math.ceil(((touch.clientX - rect.left) / rect.width) * cols)));
-    const cy = Math.min(rows, Math.max(1, Math.ceil(((touch.clientY - rect.top) / rect.height) * rows)));
+    const cx = Math.min(
+      cols,
+      Math.max(1, Math.ceil(((touch.clientX - rect.left) / rect.width) * cols)),
+    );
+    const cy = Math.min(
+      rows,
+      Math.max(1, Math.ceil(((touch.clientY - rect.top) / rect.height) * rows)),
+    );
     const button = pending > 0 ? 65 : 64;
     for (let i = 0; i < Math.abs(pending); i += 1) {
       term.input(`\x1b[<${button};${cx};${cy}M`);

@@ -78,7 +78,11 @@ export function useAnimatedResizablePanel({
 
     const handlePointerDown = (event: PointerEvent) => {
       const groupElement = resolveGroupElement();
-      if (!groupElement || !(event.target instanceof Node) || !groupElement.contains(event.target)) {
+      if (
+        !groupElement ||
+        !(event.target instanceof Node) ||
+        !groupElement.contains(event.target)
+      ) {
         return;
       }
       if (pointerUpFrameRef.current) {
@@ -193,10 +197,7 @@ export function useAnimatedResizablePanel({
       }
       if (rememberExpandedSize) {
         const currentSize = panel.getSize().asPercentage;
-        if (
-          Number.isFinite(currentSize) &&
-          currentSize >= PANEL_SIZE_REMEMBER_MIN_PERCENTAGE
-        ) {
+        if (Number.isFinite(currentSize) && currentSize >= PANEL_SIZE_REMEMBER_MIN_PERCENTAGE) {
           expandedSizeRef.current = `${currentSize}%`;
         }
       }

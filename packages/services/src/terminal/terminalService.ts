@@ -6,9 +6,7 @@ import { Emitter, type Event } from "@zcode/rpc";
 import type { IPty } from "node-pty";
 import type { ISettingService } from "../setting/setting.js";
 import type { ITerminalService, TerminalCreateResult, TerminalWindowsPtyInfo } from "./terminal.js";
-import {
-  resolveTerminalFontProfile,
-} from "./terminalProfile.js";
+import { resolveTerminalFontProfile } from "./terminalProfile.js";
 import { registerMemoryDiagnosticsProvider } from "#src/memoryDiagnostics.js";
 
 const require = createRequire(import.meta.url);
@@ -358,7 +356,11 @@ export function createTerminalService(dependencies: {
   }
 
   const service: ITerminalService & { disposeAll(): void } = {
-    async create(params: { cols: number; rows: number; cwd?: string }): Promise<TerminalCreateResult> {
+    async create(params: {
+      cols: number;
+      rows: number;
+      cwd?: string;
+    }): Promise<TerminalCreateResult> {
       const id = String(nextId++);
       const shell = resolveTerminalShell();
       const cwd = resolveTerminalCwd(params.cwd);

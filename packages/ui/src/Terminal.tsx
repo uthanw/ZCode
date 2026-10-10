@@ -85,7 +85,7 @@ export function Terminal({
       const currentWorkspace = current.workspaces[workspaceKey];
       const currentHasLive = Boolean(
         currentWorkspace &&
-          currentWorkspace.sessionIds.some((id) => Boolean(current.sessions[id]?.serverId)),
+        currentWorkspace.sessionIds.some((id) => Boolean(current.sessions[id]?.serverId)),
       );
 
       const restored = restoreWorkspaceTerminalState({ workspaceKey, services, cwd });
