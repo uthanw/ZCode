@@ -1,10 +1,9 @@
-/* eslint-disable max-lines -- 终端 resize 调度需要和 xterm/PTY 生命周期放在同一组件内，避免拖拽状态、fit、后端 resize 队列拆散后出现竞态。*/
-import { ClipboardAddon } from "@xterm/addon-clipboard";
+/* eslint-disable max-lines -- persistentKey 常驻与普通 effect 两条生命周期路径的差异（registry entry、恢复回放、cleanup 归属）必须与 resize 调度放在同一组件内对照维护，共享装配已下沉 terminalSessionWiring。 */
 import { FitAddon } from "@xterm/addon-fit";
 import { Terminal as XTerm } from "@xterm/xterm";
 import { ClipboardPaste, Copy } from "lucide-react";
 import { useCallback, useEffect, useRef } from "react";
-import type { ILink, ILinkHandler, ITheme, IWindowsPty } from "@xterm/xterm";
+import type { ITheme, IWindowsPty } from "@xterm/xterm";
 import type { IServiceAccessor } from "@zcode/services";
 import type { IDisposable } from "@zcode/rpc";
 import { useZCodeIntl } from "@/i18n/IntlProvider.js";
@@ -15,85 +14,31 @@ import {
   ContextMenuItem,
   ContextMenuTrigger,
 } from "@/components/ui/context-menu.js";
-import {
-  createPendingTerminalInputFallback,
-  consumeTerminalInputFallbackHandledData,
-  createTerminalInputFallbackKeydownCandidate,
-  markTerminalInputFallbackHandled,
-  recordTerminalInputFallbackHandledData,
-  recordTerminalInputFallbackRecentData,
-  resolveTerminalInputFallbackAction,
-  type PendingTerminalInputFallback,
-  type TerminalInputFallbackKeydownCandidate,
-  type TerminalInputFallbackHandledData,
-} from "@/terminal/terminalComposedInputFallback.js";
-import { normalizePowerShellReadlineRedraw } from "@/terminal/terminalDataTransform.js";
-
 import { installTerminalTouchScroll } from "@/terminal/terminalTouchScroll.js";
 import {
-  applyStickyCtrlToInputData,
-  applyStickyShiftToInputData,
-  consumeStickyCtrl,
-  hardenTerminalTextarea,
-  isStickyCtrlActive,
-  isStickyShiftActive,
-  noteTerminalOutput,
-} from "@/terminal/terminalExtraKeys.js";
-import { getHttpLinksForTerminalBufferLine } from "@/terminal/terminalLinks.js";
-import { mergeTerminalTheme } from "@/terminal/terminalTheme.js";
+  applyTerminalProfile,
+  attachTerminalKeyHandler,
+  createTerminalInputFallbackState,
+  fitTerminalForCreate,
+  observeTerminalResize,
+  observeTerminalTheme,
+  openTerminalInstance,
+  registerTerminalHttpLinkProvider,
+  tryFitTerminal,
+  wireTerminalProcessing,
+  type TerminalInputFallbackState,
+  type TerminalResizeRequestStats,
+  type TerminalSize,
+} from "@/terminal/terminalSessionWiring.js";
+import { normalizePowerShellReadlineRedraw } from "@/terminal/terminalDataTransform.js";
 import {
   sidePaneTerminalSessionRegistry,
   type SidePaneTerminalSessionEntry,
 } from "@/terminal/sidePaneTerminalSessionRegistry.js";
 
-const DEFAULT_TERMINAL_FONT_FAMILY =
-  "ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Monaco, Consolas, 'Cascadia Mono', 'JetBrains Mono', 'MesloLGS NF', 'Hack Nerd Font', monospace";
 const TERMINAL_RESIZE_DRAG_THROTTLE_MS = 300;
-const TERMINAL_INPUT_FALLBACK_RECENT_DATA_MS = 150;
-const TERMINAL_INPUT_FALLBACK_KEYDOWN_INPUT_MS = 40;
-const TERMINAL_INPUT_FALLBACK_FLUSH_DELAY_MS = 150;
 
 type TerminalResizeReason = "drag" | "final" | "visible" | "init" | "observer";
-
-type TerminalSize = {
-  cols: number;
-  rows: number;
-};
-
-function normalizeWindowsPtyOption(windowsPty: IWindowsPty | undefined): IWindowsPty | undefined {
-  if (!windowsPty) return undefined;
-  return windowsPty.buildNumber
-    ? { backend: windowsPty.backend, buildNumber: windowsPty.buildNumber }
-    : { backend: windowsPty.backend };
-}
-
-function normalizeTerminalFontSize(value: number | undefined): number | undefined {
-  if (typeof value !== "number" || !Number.isFinite(value) || value < 6 || value > 72) {
-    return undefined;
-  }
-  return value;
-}
-
-function formatShellLabel(shell: string | null): string | null {
-  if (!shell) {
-    return null;
-  }
-
-  const shellParts = shell.split(/[\\/]/);
-  const lastPart = shellParts[shellParts.length - 1];
-  const name = lastPart?.replace(/\.exe$/i, "").toLowerCase();
-  if (!name) {
-    return shell;
-  }
-  if (name === "powershell" || name === "pwsh") {
-    return "PowerShell";
-  }
-  return name;
-}
-
-function isHttpTerminalUrl(text: string): boolean {
-  return /^https?:\/\//i.test(text);
-}
 
 export function TerminalSession({
   sessionId,
@@ -131,7 +76,7 @@ export function TerminalSession({
    * 跨组件生命周期的会话复用 key（仅 side pane terminal 用）。
    * 传入后 xterm 实例 + PTY 所有权上移到 sidePaneTerminalSessionRegistry 模块级单例，
    * 组件卸载只 detach DOM、不 dispose；重挂按 key 复用，scrollback 历史跨 workspace 保活。
-   * 不传（下侧 terminal）走原 effect 路径，字节级不变。
+   * 不传（下侧 terminal）走原 effect 路径。
    */
   persistentKey?: string;
   /**
@@ -151,7 +96,12 @@ export function TerminalSession({
   const resizeRAFRef = useRef(0);
   const resizeThrottleTimerRef = useRef<number | null>(null);
   const isPanelResizingRef = useRef(isPanelResizing);
-  const resizeRequestStatsRef = useRef({ fit: 0, queued: 0, sent: 0, skipped: 0 });
+  const resizeRequestStatsRef = useRef<TerminalResizeRequestStats>({
+    fit: 0,
+    queued: 0,
+    sent: 0,
+    skipped: 0,
+  });
   const lastSentTerminalSizeRef = useRef<TerminalSize | null>(null);
   const pendingTerminalSizeRef = useRef<TerminalSize | null>(null);
   const resizeInFlightRef = useRef(false);
@@ -164,11 +114,9 @@ export function TerminalSession({
   // cleanup 会把刚创建的 PTY dispose 掉。挂载时读一次 ref 即可。
   const resumeServerIdRef = useRef(resumeServerId);
   const terminalProfileThemeRef = useRef<ITheme | undefined>(undefined);
-  const pendingInputFallbacksRef = useRef<PendingTerminalInputFallback[]>([]);
-  const inputFallbackKeydownCandidateRef = useRef<TerminalInputFallbackKeydownCandidate | null>(
-    null,
+  const inputFallbackStateRef = useRef<TerminalInputFallbackState>(
+    createTerminalInputFallbackState(),
   );
-  const recentInputFallbackHandledDataRef = useRef<TerminalInputFallbackHandledData[]>([]);
 
   exitedMessageRef.current = intl.formatMessage({ id: "terminal.exited" });
   exitHandlerRef.current = onExit;
@@ -360,11 +308,13 @@ export function TerminalSession({
   useEffect(() => {
     const el = containerRef.current;
     if (!el) return;
+    const openUrl = (url: string) => openBrowserUrlRef.current(url);
 
     // ===== persistentKey 路径：side pane terminal 跨 workspace 会话保活 =====
     // xterm 实例 + PTY 所有权上移到 sidePaneTerminalSessionRegistry 模块级单例，
     // 组件卸载只 detach DOM、不 dispose；重挂按 persistentKey 复用，scrollback 跨 workspace 保活。
-    // 原路径（下侧 terminal，不传 persistentKey）字节级不变。
+    // 与普通路径的差异全部集中在「资源生命周期」：装配逻辑（按键处理/订阅/IME 兜底）
+    // 共享 terminalSessionWiring，订阅挂到 registryDisposers 随 entry 常驻。
     if (persistentKey) {
       terminalProfileThemeRef.current = undefined;
       const existingEntry = sidePaneTerminalSessionRegistry.get(persistentKey);
@@ -375,28 +325,20 @@ export function TerminalSession({
         fitAddonRef.current = existingEntry.fitAddon;
         terminalIdRef.current = existingEntry.terminalId || undefined;
         el.appendChild(existingEntry.hostEl);
-        const reuseThemeObserver = new MutationObserver(() => {
-          // 从 entry.profileTheme 读：重挂后组件局部 ref 已重置为 undefined，
-          // profile theme 只存在于 registry entry，必须从 entry 取（否则丢用户配置的终端颜色）。
-          existingEntry.term.options.theme = mergeTerminalTheme(existingEntry.profileTheme);
-        });
-        reuseThemeObserver.observe(document.documentElement, {
-          attributes: true,
-          attributeFilter: ["class"],
-        });
-        let reuseResizeRAF = 0;
-        const reuseResizeObserver = new ResizeObserver(() => {
-          if (!isVisibleRef.current) return;
-          if (reuseResizeRAF) cancelAnimationFrame(reuseResizeRAF);
-          reuseResizeRAF = requestAnimationFrame(() => scheduleFitAndResize("observer"));
-        });
-        reuseResizeObserver.observe(el);
-        try {
-          resizeRequestStatsRef.current.fit += 1;
-          existingEntry.fitAddon.fit();
-        } catch (error) {
-          logger.warn("[Terminal] persistent reuse fit failed:", error);
-        }
+        // 从 entry.profileTheme 读：重挂后组件局部 ref 已重置为 undefined，
+        // profile theme 只存在于 registry entry，必须从 entry 取（否则丢用户配置的终端颜色）。
+        const reuseThemeObserver = observeTerminalTheme(
+          existingEntry.term,
+          () => existingEntry.profileTheme,
+        );
+        const reuseResizeObserver = observeTerminalResize(
+          el,
+          () => {
+            scheduleFitAndResize("observer");
+          },
+          () => isVisibleRef.current,
+        );
+        tryFitTerminal(existingEntry.fitAddon, resizeRequestStatsRef, "persistent reuse");
         if (isVisibleRef.current) {
           requestFocus();
         }
@@ -405,9 +347,8 @@ export function TerminalSession({
           persistentKey,
         });
         return () => {
-          reuseThemeObserver.disconnect();
-          reuseResizeObserver.disconnect();
-          if (reuseResizeRAF) cancelAnimationFrame(reuseResizeRAF);
+          reuseThemeObserver.dispose();
+          reuseResizeObserver.dispose();
           sidePaneTerminalSessionRegistry.detachDom(persistentKey);
           // 不 dispose：term/PTY/订阅都留在 registry 供下次复用
           termRef.current = null;
@@ -424,140 +365,32 @@ export function TerminalSession({
       const registryDisposers: IDisposable[] = [];
       const localDisposers: IDisposable[] = [];
 
-      const term = new XTerm({
-        fontSize: 13,
-        fontFamily: DEFAULT_TERMINAL_FONT_FAMILY,
-        theme: mergeTerminalTheme(terminalProfileThemeRef.current),
-        linkHandler: {
-          allowNonHttpProtocols: false,
-          activate(event, text) {
-            if (!isHttpTerminalUrl(text)) return;
-            event.preventDefault();
-            logger.debug("[Terminal] open OSC 8 http link", { url: text });
-            openBrowserUrlRef.current(text);
-          },
-        } satisfies ILinkHandler,
-      });
+      const { term, fitAddon } = openTerminalInstance(hostEl, openUrl);
       termRef.current = term;
-
-      const fitAddon = new FitAddon();
       fitAddonRef.current = fitAddon;
-      term.loadAddon(fitAddon);
-      term.loadAddon(new ClipboardAddon());
-      term.open(hostEl);
-      hardenTerminalTextarea(term);
 
-      let initialTerminalSize: TerminalSize | null = null;
-      if (isVisibleRef.current && hostEl.clientWidth > 0 && hostEl.clientHeight > 0) {
-        try {
-          resizeRequestStatsRef.current.fit += 1;
-          fitAddon.fit();
-          initialTerminalSize = { cols: term.cols, rows: term.rows };
-          lastSentTerminalSizeRef.current = initialTerminalSize;
-          logger.debug("[Terminal] initial fit before create (persistent)", {
-            cols: initialTerminalSize.cols,
-            rows: initialTerminalSize.rows,
-            terminalTabId: sessionId,
-          });
-        } catch (error) {
-          logger.warn("[Terminal] persistent initial fit failed:", error);
-        }
-      }
+      const initialTerminalSize = fitTerminalForCreate({
+        term,
+        fitAddon,
+        host: hostEl,
+        isVisible: () => isVisibleRef.current,
+        stats: resizeRequestStatsRef,
+        lastSentSize: lastSentTerminalSizeRef,
+        sessionId,
+        persistent: true,
+      });
       if (isVisibleRef.current) {
         requestFocus();
       }
 
-      // 组件局部：customKeyEventHandler（依赖组件 inputFallback ref）
-      term.attachCustomKeyEventHandler((e) => {
-        if (e.type !== "keydown") return true;
-        // Termux 式粘滞 Ctrl：小屏补全按键栏激活后，下一个软键盘可打印键
-        // 按 Ctrl 组合发送（如 Ctrl+C 中断）。桌面真实 Ctrl 键自带 e.ctrlKey，不走这里。
-        if (isStickyCtrlActive() && !e.ctrlKey && e.key.length === 1) {
-          consumeStickyCtrl();
-          // 必须取消默认行为：否则浏览器继续产生 beforeinput/input，应用的
-          // 组合输入兜底会把它当作 IME 文本再写一次 PTY（Ctrl+C 变成 "^C"+"c"）。
-          e.preventDefault();
-          e.stopPropagation();
-          term.input(String.fromCharCode(e.key.charCodeAt(0) & 0x1f));
-          return false;
-        }
-        // 粘滞 Shift 是锁定式的（一直生效到手动关闭），这里只标记，
-        // 不在这里发字节：软键盘路径会走 onData 漏斗统一变换。
-        if (isStickyShiftActive() && !e.shiftKey && e.key.length === 1 && !e.ctrlKey && !e.altKey) {
-          e.preventDefault();
-          e.stopPropagation();
-        }
-        inputFallbackKeydownCandidateRef.current =
-          e.metaKey || e.ctrlKey || e.altKey
-            ? null
-            : createTerminalInputFallbackKeydownCandidate({
-                eventTimeStamp: e.timeStamp,
-                key: e.key,
-                now: performance.now(),
-              });
-        if (!(e.metaKey || e.ctrlKey)) return true;
-        const key = e.key.toLowerCase();
-        if (key === "c" && term.hasSelection()) {
-          void navigator.clipboard.writeText(term.getSelection()).catch((err) => {
-            logger.warn("[Terminal] copy via shortcut failed:", err);
-          });
-          return false;
-        }
-        if (key === "v") {
-          // attachCustomKeyEventHandler 返回 false 只阻止 xterm 处理 Ctrl+V，
-          // 不会取消浏览器随后派发的原生 paste 事件；这里手动 paste 一次后，
-          // 原生 paste 又会被 xterm 的内置监听写入一次，导致快捷键粘贴重复。
-          // 因此必须先取消默认事件，再保留手动读取剪贴板的单次写入。
-          // 与原路径（下侧 terminal）字节对齐：两份拷贝曾在此漂移（persistentKey 漏了 debug 日志），
-          // 待后续重构收敛为单一 wireTerminalProcessing 后此注释删除。
-          e.preventDefault();
-          e.stopPropagation();
-          navigator.clipboard
-            .readText()
-            .then((text) => {
-              logger.debug("[Terminal] paste via shortcut", { length: text.length });
-              if (text) term.paste(text);
-            })
-            .catch((err) => logger.warn("[Terminal] paste via shortcut failed:", err));
-          return false;
-        }
-        return true;
-      });
-
-      // 组件局部：主题 observer
-      const themeObserver = new MutationObserver(() => {
-        // 从 entry.profileTheme 读：profile theme 所有权在 registry entry，跨重挂常驻；
-        // 组件局部 terminalProfileThemeRef 在重挂后会丢失 profile theme，不能作为 observer 数据源。
-        term.options.theme = mergeTerminalTheme(entry.profileTheme);
-      });
-      themeObserver.observe(document.documentElement, {
-        attributes: true,
-        attributeFilter: ["class"],
-      });
-      localDisposers.push({ dispose: () => themeObserver.disconnect() } as IDisposable);
+      attachTerminalKeyHandler(term, inputFallbackStateRef);
+      // 从 entry.profileTheme 读：profile theme 所有权在 registry entry，跨重挂常驻；
+      // 组件局部 terminalProfileThemeRef 在重挂后会丢失 profile theme，不能作为 observer 数据源。
+      const themeObserver = observeTerminalTheme(term, () => entry.profileTheme);
+      localDisposers.push(themeObserver);
 
       // 进 registry：linkProvider（detached 时保留无害）
-      registryDisposers.push(
-        term.registerLinkProvider({
-          provideLinks(bufferLineNumber, callback) {
-            const links = getHttpLinksForTerminalBufferLine(
-              term.buffer.active,
-              bufferLineNumber,
-              term.cols,
-            )?.map(
-              (link): ILink => ({
-                ...link,
-                activate(event, text) {
-                  event.preventDefault();
-                  logger.debug("[Terminal] open plain http link", { url: text });
-                  openBrowserUrlRef.current(text);
-                },
-              }),
-            );
-            callback(links);
-          },
-        }),
-      );
+      registryDisposers.push(registerTerminalHttpLinkProvider(term, openUrl));
 
       // entry 先占位存入 registry（terminalId 异步填），重挂/回收据此判断
       const entry: SidePaneTerminalSessionEntry = {
@@ -595,158 +428,48 @@ export function TerminalSession({
       const initialCreateSize = initialTerminalSize ?? { cols: term.cols, rows: term.rows };
       void services.terminalService
         .create({ cols: initialCreateSize.cols, rows: initialCreateSize.rows, cwd })
-        .then(({ id, shell, fontFamily, fontSize, theme, fontFamilySource, windowsPty }) => {
+        .then((result) => {
           if (ptyCancelled) {
             // cleanup 已发生：杀掉这个孤儿 PTY，不进 entry
-            void services.terminalService.dispose({ id });
+            void services.terminalService.dispose({ id: result.id });
             return;
           }
-          entry.terminalId = id;
-          terminalIdRef.current = id;
-          // 与原路径对称：id ready 后立即 flush 创建期间排队的 resize（pendingTerminalSizeRef）。
+          entry.terminalId = result.id;
+          terminalIdRef.current = result.id;
+          // id ready 后立即 flush 创建期间排队的 resize（pendingTerminalSizeRef）。
           // 否则 scheduleFitAndResize("init") 会因 pendingSize 去重跳过，PTY 停在错误 cols/rows。
           flushTerminalServiceResize();
-          term.options.windowsPty = normalizeWindowsPtyOption(windowsPty);
-          term.options.fontFamily = fontFamily || DEFAULT_TERMINAL_FONT_FAMILY;
-          const nextFontSize = normalizeTerminalFontSize(fontSize);
-          if (nextFontSize) {
-            term.options.fontSize = nextFontSize;
-          }
-          terminalProfileThemeRef.current = theme as ITheme | undefined;
-          // profile theme 所有权上移到 registry entry，
-          // 跨组件生命周期复用不丢（原仅写组件局部 ref，重挂后新组件 ref=undefined → 复用 observer 用 undefined 合并 → 丢失）。
-          entry.profileTheme = theme as ITheme | undefined;
-          term.options.theme = mergeTerminalTheme(entry.profileTheme);
-          const nextShellLabel = formatShellLabel(shell);
-          logger.info("[Terminal] shell resolved (persistent):", {
+          // profile theme 所有权上移到 registry entry，跨组件生命周期复用不丢
+          // （原仅写组件局部 ref，重挂后新组件 ref=undefined → 复用 observer 用 undefined 合并 → 丢失）。
+          entry.profileTheme = applyTerminalProfile(term, {
+            profile: result,
+            terminalId: result.id,
+            sessionId,
             cwd,
-            fontFamilySource,
-            shell,
-            shellLabel: nextShellLabel,
-            terminalId: id,
-            terminalTabId: sessionId,
+            onShellLabelChange,
           });
-          onShellLabelChange(sessionId, nextShellLabel);
           scheduleFitAndResize("init");
           if (isVisibleRef.current) {
             requestFocus();
           }
 
-          // data 订阅 → term.write（进 registry，detached 时仍累积 scrollback）
-          registryDisposers.push(
-            services.terminalService.onDynamicData(id)((data) => {
-              noteTerminalOutput(term, data);
-              term.write(normalizePowerShellReadlineRedraw(data, shell));
-            }),
-          );
-          // exit 订阅（进 registry，与原路径对称：有 onExit 则回调，否则写退出提示）
-          registryDisposers.push(
-            services.terminalService.onDynamicExit(id)((exitCode) => {
-              const exitHandler = exitHandlerRef.current;
-              logger.info("[Terminal] persistent session exited", {
-                autoClose: Boolean(exitHandler),
-                exitCode,
-                terminalId: id,
-                terminalTabId: sessionId,
-              });
-              if (exitHandler) {
-                exitHandler(sessionId, exitCode);
-                return;
-              }
-              // side pane Terminal 不传 onExit，保留退出提示。
-              term.write(`\r\n${exitedMessageRef.current}\r\n`);
-            }),
-          );
-
-          // onData（进 registry，随 term 常驻）：
-          // 不能放 localDisposers：cleanup(detach) 时会被取消，而复用路径不重绑，
-          // 导致切回 workspace 后 scrollback 在但无法输入交互。
-          // 输入订阅生命周期必须 = entry 生命周期（随 term 常驻），detach 不取消。
-          //
-          // 与原路径（下侧 terminal）的 onData 完全一致：维护 keydown candidate 去重历史，
-          // 供 Windows 输入法 textarea 兜底消费（IME composition committed text 的三段去重闭环）。
-          // 注：本段只处理「已提交 composition 文本」的去重，与 Shift 切换输入法动作无关——
-          // Shift 切换是输入法系统级行为（customKeyEventHandler 对 Shift 直接 return true 放行）；
-          // 「Shift 切英文后字符丢失」的真根因是 isWindowsDesktop 未透传（已在 WorkspaceShellLayout 修复）。
-          registryDisposers.push(
-            term.onData((rawData) => {
-              // 粘滞 Ctrl 统一漏斗：Android 软键盘走 composition、不发标准 keydown，
-              // 只有 onData 能覆盖全部输入路径（keydown/组合输入/粘贴）。
-              const data = applyStickyShiftToInputData(applyStickyCtrlToInputData(rawData));
-              const now = performance.now();
-              const inputFallbackKeydownCandidate = inputFallbackKeydownCandidateRef.current;
-              const handledData = recordTerminalInputFallbackHandledData({
-                candidate: inputFallbackKeydownCandidate,
-                data,
-                history: recentInputFallbackHandledDataRef.current,
-                maxAgeMs: TERMINAL_INPUT_FALLBACK_RECENT_DATA_MS,
-                now,
-              });
-              recentInputFallbackHandledDataRef.current = handledData.usedCandidate
-                ? handledData.history
-                : recordTerminalInputFallbackRecentData({
-                    data,
-                    history: handledData.history,
-                    maxAgeMs: TERMINAL_INPUT_FALLBACK_RECENT_DATA_MS,
-                    now,
-                  });
-              if (handledData.usedCandidate) {
-                inputFallbackKeydownCandidateRef.current = null;
-              }
-              markTerminalInputFallbackHandled(pendingInputFallbacksRef.current, data);
-              void services.terminalService.write({ id, data });
-            }),
-          );
-
-          // Windows 输入法兜底（进 registry，随 term 常驻，与 onData 同生命周期）。
-          // textarea 元素随 term 实例常驻，监听绑一次即可；detach 不取消，重挂后中文输入法兜底仍生效。
-          const textarea =
-            isWindowsDesktop &&
-            (term as unknown as { _core: { textarea: HTMLTextAreaElement } })._core?.textarea;
-          if (textarea) {
-            const handleInput = (e: InputEvent) => {
-              if (e.inputType !== "insertText" || !e.data || !e.composed) return;
-              const insertedText = e.data;
-              const now = performance.now();
-              const pendingFallback = createPendingTerminalInputFallback(insertedText);
-              pendingInputFallbacksRef.current.push(pendingFallback);
-              consumeTerminalInputFallbackHandledData({
-                history: recentInputFallbackHandledDataRef.current,
-                inputEventTimeStamp: e.timeStamp,
-                maxAgeMs: TERMINAL_INPUT_FALLBACK_RECENT_DATA_MS,
-                maxInputDelayMs: TERMINAL_INPUT_FALLBACK_KEYDOWN_INPUT_MS,
-                now,
-                pending: pendingFallback,
-              });
-              setTimeout(() => {
-                pendingInputFallbacksRef.current = pendingInputFallbacksRef.current.filter(
-                  (item) => item !== pendingFallback,
-                );
-                // 不检查 ptyCancelled：订阅已随 entry 常驻（registryDisposers），
-                // ptyCancelled 是单次 effect 闭包变量，detach 后会变 true 导致 fallback 永久失效。
-                // release 时 entry.dispose 会移除本监听；PTY disposed 后 write 为 no-op，安全。
-                const fallbackAction = resolveTerminalInputFallbackAction({
-                  pending: pendingFallback,
-                  textareaValue: textarea.value,
-                });
-                if (fallbackAction.shouldWrite) {
-                  logger.debug("[Terminal] flush composed input fallback (persistent)", {
-                    length: insertedText.length,
-                    terminalId: id,
-                    terminalTabId: sessionId,
-                  });
-                  void services.terminalService.write({ id, data: insertedText });
-                }
-                if (fallbackAction.shouldClearTextarea) {
-                  textarea.value = "";
-                }
-              }, TERMINAL_INPUT_FALLBACK_FLUSH_DELAY_MS);
-            };
-            textarea.addEventListener("input", handleInput, true);
-            registryDisposers.push({
-              dispose: () => textarea.removeEventListener("input", handleInput, true),
-            } as IDisposable);
-          }
+          // PTY 订阅装配（进 registryDisposers，随 entry 常驻）：detached 时 data 订阅
+          // 仍累积 scrollback；onData/IME 兜底不随 detach 取消，重挂后输入交互照常。
+          wireTerminalProcessing({
+            term,
+            service: services.terminalService,
+            id: result.id,
+            shell: result.shell,
+            sessionId,
+            isWindowsDesktop,
+            disposables: registryDisposers,
+            fallbackState: inputFallbackStateRef,
+            getExitHandler: () => exitHandlerRef.current,
+            getExitedMessage: () => exitedMessageRef.current,
+            // 订阅随 entry 常驻：不检查单次 effect 的 ptyCancelled（detach 后变 true
+            // 会让 IME 兜底永久失效）；release 时 entry.dispose 才是真生命周期终点。
+            isTornDown: () => false,
+          });
         })
         .catch((error) => {
           if (ptyCancelled) return;
@@ -754,10 +477,10 @@ export function TerminalSession({
           logger.error("[Terminal] persistent create failed:", error);
           term.write(`\r\n[Terminal failed to start]\r\n${message}\r\n`);
           // PTY 创建失败必须释放 registry 中本次占位的 entry。
-          // entry 在上方以 terminalId="" 占位先 register（line 541），再异步 terminalService.create()。
+          // entry 在上方以 terminalId="" 占位先 register，再异步 terminalService.create()。
           // 若失败不释放，terminalId="" 的僵尸 entry 会留在 registry，重挂/切 workspace 时命中
-          // 复用快路径（见上方 existingEntry 分支），直接复用已启动失败的 xterm，且永不重新
-          // terminalService.create()，该终端永久无法连接 PTY。
+          // 复用快路径，直接复用已启动失败的 xterm，且永不重新 terminalService.create()，
+          // 该终端永久无法连接 PTY。
           //
           // ownership 校验（稳妥方案）：只有 registry 当前 entry 仍是本次创建的 entry 时才释放。
           // 极端时序：create reject 触发前，组件可能已卸载（cleanup 已 release 半成品，见下方 !entry.terminalId
@@ -770,13 +493,15 @@ export function TerminalSession({
         });
 
       // 组件局部：resize observer
-      let resizeRAF = 0;
-      const resizeObserver = new ResizeObserver(() => {
-        if (!isVisibleRef.current) return;
-        if (resizeRAF) cancelAnimationFrame(resizeRAF);
-        resizeRAF = requestAnimationFrame(() => scheduleFitAndResize("observer"));
-      });
-      resizeObserver.observe(el);
+      localDisposers.push(
+        observeTerminalResize(
+          el,
+          () => {
+            scheduleFitAndResize("observer");
+          },
+          () => isVisibleRef.current,
+        ),
+      );
 
       logger.debug("[Terminal] persistent create", {
         terminalTabId: sessionId,
@@ -785,9 +510,6 @@ export function TerminalSession({
 
       return () => {
         ptyCancelled = true;
-        themeObserver.disconnect();
-        resizeObserver.disconnect();
-        if (resizeRAF) cancelAnimationFrame(resizeRAF);
         for (const d of localDisposers) {
           try {
             d.dispose();
@@ -810,144 +532,30 @@ export function TerminalSession({
     let disposed = false;
     terminalProfileThemeRef.current = undefined;
 
-    const term = new XTerm({
-      fontSize: 13,
-      fontFamily: DEFAULT_TERMINAL_FONT_FAMILY,
-      theme: mergeTerminalTheme(terminalProfileThemeRef.current),
-      linkHandler: {
-        allowNonHttpProtocols: false,
-        activate(event, text) {
-          if (!isHttpTerminalUrl(text)) {
-            return;
-          }
-          event.preventDefault();
-          logger.debug("[Terminal] open OSC 8 http link", { url: text });
-          openBrowserUrlRef.current(text);
-        },
-      } satisfies ILinkHandler,
-    });
+    const { term, fitAddon } = openTerminalInstance(el, openUrl);
     termRef.current = term;
-
-    const fitAddon = new FitAddon();
     fitAddonRef.current = fitAddon;
-    term.loadAddon(fitAddon);
-    // 接入 ClipboardAddon 以支持 OSC 52，并让 xterm 的 copy 事件把选区写入系统剪贴板。
-    term.loadAddon(new ClipboardAddon());
-    term.open(el);
-    hardenTerminalTextarea(term);
-    let initialTerminalSize: TerminalSize | null = null;
-    if (isVisibleRef.current && el.clientWidth > 0 && el.clientHeight > 0) {
-      try {
-        // side pane 终端挂载时如果先用 xterm 默认列数创建 PTY，
-        // 启动输出会在随后 fit/resize 时按错误宽度重排，zsh 可能显示反白的 PROMPT_EOL_MARK。
-        // 首次可见时先同步 fit，再用真实 cols/rows 启动 PTY，避免启动输出和尺寸校正竞态。
-        resizeRequestStatsRef.current.fit += 1;
-        fitAddon.fit();
-        initialTerminalSize = { cols: term.cols, rows: term.rows };
-        lastSentTerminalSizeRef.current = initialTerminalSize;
-        logger.debug("[Terminal] initial fit before create", {
-          cols: initialTerminalSize.cols,
-          rows: initialTerminalSize.rows,
-          terminalTabId: sessionId,
-        });
-      } catch (error) {
-        logger.warn("[Terminal] initial fit failed:", error);
-      }
-    }
+
+    const initialTerminalSize = fitTerminalForCreate({
+      term,
+      fitAddon,
+      host: el,
+      isVisible: () => isVisibleRef.current,
+      stats: resizeRequestStatsRef,
+      lastSentSize: lastSentTerminalSizeRef,
+      sessionId,
+      persistent: false,
+    });
     if (isVisibleRef.current) {
       requestFocus();
     }
 
-    // 拦截 Ctrl/Cmd+C、Ctrl/Cmd+V：
-    // - Ctrl+C 在 Win/Linux 默认会被当作 SIGINT 传给 PTY，必须在有选区时改走复制；
-    // - Ctrl+V 不拦截会被当作 `^V` 字符输入。
-    term.attachCustomKeyEventHandler((e) => {
-      if (e.type !== "keydown") return true;
-      // 与上方 persistentKey 路径一致：粘滞 Ctrl 激活时软键盘可打印键转 Ctrl 组合。
-      if (isStickyCtrlActive() && !e.ctrlKey && e.key.length === 1) {
-        consumeStickyCtrl();
-        // 同上方 persistentKey 路径：取消默认行为，避免组合输入兜底重复写入。
-        e.preventDefault();
-        e.stopPropagation();
-        term.input(String.fromCharCode(e.key.charCodeAt(0) & 0x1f));
-        return false;
-      }
-      // 与上方 persistentKey 路径一致：粘滞 Shift 是锁定式的，这里只标记，
-      // 不在这里发字节：软键盘路径会走 onData 漏斗统一变换。
-      if (isStickyShiftActive() && !e.shiftKey && e.key.length === 1 && !e.ctrlKey && !e.altKey) {
-        e.preventDefault();
-        e.stopPropagation();
-      }
-      inputFallbackKeydownCandidateRef.current =
-        e.metaKey || e.ctrlKey || e.altKey
-          ? null
-          : createTerminalInputFallbackKeydownCandidate({
-              eventTimeStamp: e.timeStamp,
-              key: e.key,
-              now: performance.now(),
-            });
-      if (!(e.metaKey || e.ctrlKey)) return true;
-      const key = e.key.toLowerCase();
-      if (key === "c" && term.hasSelection()) {
-        void navigator.clipboard.writeText(term.getSelection()).catch((err) => {
-          logger.warn("[Terminal] copy via shortcut failed:", err);
-        });
-        return false;
-      }
-      if (key === "v") {
-        // attachCustomKeyEventHandler 返回 false 只阻止 xterm 处理 Ctrl+V，
-        // 不会取消浏览器随后派发的原生 paste 事件；这里手动 paste 一次后，
-        // 原生 paste 又会被 xterm 的内置监听写入一次，导致快捷键粘贴重复。
-        // 因此必须先取消默认事件，再保留手动读取剪贴板的单次写入。
-        e.preventDefault();
-        e.stopPropagation();
-        navigator.clipboard
-          .readText()
-          .then((text) => {
-            logger.debug("[Terminal] paste via shortcut", { length: text.length });
-            if (text) term.paste(text);
-          })
-          .catch((err) => logger.warn("[Terminal] paste via shortcut failed:", err));
-        return false;
-      }
-      return true;
-    });
+    attachTerminalKeyHandler(term, inputFallbackStateRef);
+    const themeObserver = observeTerminalTheme(term, () => terminalProfileThemeRef.current);
 
-    // 监听主题切换，实时更新 terminal 配色
-    const observer = new MutationObserver(() => {
-      term.options.theme = mergeTerminalTheme(terminalProfileThemeRef.current);
-    });
-    observer.observe(document.documentElement, {
-      attributes: true,
-      attributeFilter: ["class"],
-    });
-
-    const disposables: IDisposable[] = [];
+    const disposables: IDisposable[] = [themeObserver];
     const { terminalService } = services;
-    disposables.push(
-      // 交互说明：plain URL 不属于 React DOM，必须通过 xterm link provider 从 buffer
-      // 计算可点击区域，再统一交给右侧 browser pane，避免在终端层直接碰平台 API。
-      term.registerLinkProvider({
-        provideLinks(bufferLineNumber, callback) {
-          const links = getHttpLinksForTerminalBufferLine(
-            term.buffer.active,
-            bufferLineNumber,
-            term.cols,
-          )?.map(
-            (link): ILink => ({
-              ...link,
-              activate(event, text) {
-                event.preventDefault();
-                logger.debug("[Terminal] open plain http link", { url: text });
-                openBrowserUrlRef.current(text);
-              },
-            }),
-          );
-
-          callback(links);
-        },
-      }),
-    );
+    disposables.push(registerTerminalHttpLinkProvider(term, openUrl));
 
     // 优先使用 workspace 路径作为 terminal 工作目录，未设置时后端回退到 HOME
     const initialCreateSize = initialTerminalSize ?? { cols: term.cols, rows: term.rows };
@@ -964,7 +572,7 @@ export function TerminalSession({
       replay: string,
       createdLocally = false,
     ): void => {
-      const { id, shell, fontFamily, fontSize, theme, fontFamilySource, windowsPty } = result;
+      const { id, shell } = result;
       if (disposed) {
         // 只回收本会话新建的 PTY；resume 分支的 PTY 属于刷新前页面，不能杀。
         if (createdLocally) {
@@ -978,26 +586,13 @@ export function TerminalSession({
       // 首次 fit 或 ResizeObserver 可能早于 terminal id ready，先把 resize
       // 暂存在 pendingTerminalSizeRef；id ready 后必须主动 flush，否则相同尺寸会被去重逻辑跳过。
       flushTerminalServiceResize();
-      // Windows ConPTY 在 resize 增高时不会像传统 Unix PTY 一样把 scrollback 拉回 viewport，
-      // 不开启 xterm 的 windowsPty 兼容会让 PSReadLine 后续按旧坐标重绘，覆盖到上一条命令输出行。
-      term.options.windowsPty = normalizeWindowsPtyOption(windowsPty);
-      term.options.fontFamily = fontFamily || DEFAULT_TERMINAL_FONT_FAMILY;
-      const nextFontSize = normalizeTerminalFontSize(fontSize);
-      if (nextFontSize) {
-        term.options.fontSize = nextFontSize;
-      }
-      terminalProfileThemeRef.current = theme as ITheme | undefined;
-      term.options.theme = mergeTerminalTheme(terminalProfileThemeRef.current);
-      const nextShellLabel = formatShellLabel(shell);
-      logger.info("[Terminal] shell resolved:", {
-        cwd,
-        fontFamilySource,
-        shell,
-        shellLabel: nextShellLabel,
+      terminalProfileThemeRef.current = applyTerminalProfile(term, {
+        profile: result,
         terminalId: id,
-        terminalTabId: sessionId,
+        sessionId,
+        cwd,
+        onShellLabelChange,
       });
-      onShellLabelChange(sessionId, nextShellLabel);
       if (replay) {
         // 刷新恢复：先整体回放服务端缓冲（含断连期间输出），再订阅实时流。
         term.write(normalizePowerShellReadlineRedraw(replay, shell));
@@ -1007,121 +602,20 @@ export function TerminalSession({
         requestFocus();
       }
 
-      disposables.push(
-        terminalService.onDynamicData(id)((data) => {
-          noteTerminalOutput(term, data);
-          term.write(normalizePowerShellReadlineRedraw(data, shell));
-        }),
-      );
-
-      disposables.push(
-        terminalService.onDynamicExit(id)((exitCode) => {
-          const exitHandler = exitHandlerRef.current;
-          logger.info("[Terminal] terminal session exited", {
-            autoClose: Boolean(exitHandler),
-            exitCode,
-            terminalId: id,
-            terminalTabId: sessionId,
-          });
-          if (exitHandler) {
-            exitHandler(sessionId, exitCode);
-            return;
-          }
-
-          // side pane Terminal 不属于底部 tab registry，未传 onExit 时继续保留退出提示。
-          term.write(`\r\n${exitedMessageRef.current}\r\n`);
-        }),
-      );
-
-      disposables.push(
-        term.onData((rawData) => {
-          // 与 persistentKey 路径一致：粘滞 Ctrl / Shift 在 onData 漏斗上统一应用，
-          // 覆盖软键盘 composition 等不产生标准 keydown 的输入模型。
-          const data = applyStickyShiftToInputData(applyStickyCtrlToInputData(rawData));
-          const now = performance.now();
-          const inputFallbackKeydownCandidate = inputFallbackKeydownCandidateRef.current;
-          const handledData = recordTerminalInputFallbackHandledData({
-            candidate: inputFallbackKeydownCandidate,
-            data,
-            history: recentInputFallbackHandledDataRef.current,
-            maxAgeMs: TERMINAL_INPUT_FALLBACK_RECENT_DATA_MS,
-            now,
-          });
-          recentInputFallbackHandledDataRef.current = handledData.usedCandidate
-            ? handledData.history
-            : recordTerminalInputFallbackRecentData({
-                data,
-                history: handledData.history,
-                maxAgeMs: TERMINAL_INPUT_FALLBACK_RECENT_DATA_MS,
-                now,
-              });
-          if (handledData.usedCandidate) {
-            inputFallbackKeydownCandidateRef.current = null;
-          }
-          markTerminalInputFallbackHandled(pendingInputFallbacksRef.current, data);
-          terminalService.write({ id, data });
-        }),
-      );
-
-      // Windows desktop 下某些输入法会把 composed text 留在 textarea 里，
-      // xterm 可能只处理到一半；这里保留兜底。但 Linux Wayland 已确认会和 xterm 的
-      // onData 路径重复写入，所以必须显式收窄到 Windows，避免把正常链路误伤。
-      const textarea =
-        isWindowsDesktop &&
-        (term as unknown as { _core: { textarea: HTMLTextAreaElement } })._core?.textarea;
-      if (textarea) {
-        const handleInput = (e: InputEvent) => {
-          // 只处理组合文本的 insertText
-          if (e.inputType !== "insertText" || !e.data || !e.composed) return;
-          const insertedText = e.data;
-          const now = performance.now();
-          const pendingFallback = createPendingTerminalInputFallback(insertedText);
-          pendingInputFallbacksRef.current.push(pendingFallback);
-          // 普通空格会先经 keydown 被 xterm onData 写入 PTY，随后浏览器才派发 composed input。
-          // 搜狗输入法也会在没有稳定 keydown candidate 的情况下先触发 xterm onData、后触发 composed input。
-          // 这里消费同一次输入附近的未消费 onData，避免把同一段组合文本再兜底写入一次。
-          consumeTerminalInputFallbackHandledData({
-            history: recentInputFallbackHandledDataRef.current,
-            inputEventTimeStamp: e.timeStamp,
-            maxAgeMs: TERMINAL_INPUT_FALLBACK_RECENT_DATA_MS,
-            maxInputDelayMs: TERMINAL_INPUT_FALLBACK_KEYDOWN_INPUT_MS,
-            now,
-            pending: pendingFallback,
-          });
-
-          // 延迟检查：等 xterm 的 onData 先认领 pending，再判断是否需要兜底写入。
-          setTimeout(() => {
-            pendingInputFallbacksRef.current = pendingInputFallbacksRef.current.filter(
-              (item) => item !== pendingFallback,
-            );
-            if (disposed) {
-              return;
-            }
-            const fallbackAction = resolveTerminalInputFallbackAction({
-              pending: pendingFallback,
-              textareaValue: textarea.value,
-            });
-            if (fallbackAction.shouldWrite) {
-              // 普通空格也会触发 composed input，且 xterm 已经通过 onData 写入 PTY。
-              // 只看 textarea.value 会把空格再手动写一次；这里必须确认 onData 没处理过才兜底。
-              logger.debug("[Terminal] flush composed input fallback", {
-                length: insertedText.length,
-                terminalId: id,
-                terminalTabId: sessionId,
-              });
-              terminalService.write({ id, data: insertedText });
-            }
-            if (fallbackAction.shouldClearTextarea) {
-              textarea.value = "";
-            }
-          }, TERMINAL_INPUT_FALLBACK_FLUSH_DELAY_MS);
-        };
-
-        textarea.addEventListener("input", handleInput, true);
-        disposables.push({
-          dispose: () => textarea.removeEventListener("input", handleInput, true),
-        } as IDisposable);
-      }
+      wireTerminalProcessing({
+        term,
+        service: terminalService,
+        id,
+        shell,
+        sessionId,
+        isWindowsDesktop,
+        disposables,
+        fallbackState: inputFallbackStateRef,
+        getExitHandler: () => exitHandlerRef.current,
+        getExitedMessage: () => exitedMessageRef.current,
+        // IME 兜底的延迟 flush 前检查组件是否已卸载：disposed 后 textarea 即将随 term.dispose 销毁。
+        isTornDown: () => disposed,
+      });
     };
 
     // 刷新恢复：优先重连 localStorage 记录的服务端 PTY（服务端在客户端断连时按设计不回收 pty），
@@ -1171,25 +665,22 @@ export function TerminalSession({
 
     void setupTerminal();
 
-    let resizeRAF = 0;
-    const resizeObserver = new ResizeObserver(() => {
-      if (!isVisibleRef.current) return;
-      if (resizeRAF) cancelAnimationFrame(resizeRAF);
-      resizeRAF = requestAnimationFrame(() => scheduleFitAndResize("observer"));
-    });
-    resizeObserver.observe(el);
+    disposables.push(
+      observeTerminalResize(
+        el,
+        () => {
+          scheduleFitAndResize("observer");
+        },
+        () => isVisibleRef.current,
+      ),
+    );
 
     return () => {
       disposed = true;
-      observer.disconnect();
-      resizeObserver.disconnect();
       clearResizeThrottleTimer();
-      if (resizeRAF) cancelAnimationFrame(resizeRAF);
       if (resizeRAFRef.current) cancelAnimationFrame(resizeRAFRef.current);
       if (focusRAFRef.current) cancelAnimationFrame(focusRAFRef.current);
-      pendingInputFallbacksRef.current = [];
-      inputFallbackKeydownCandidateRef.current = null;
-      recentInputFallbackHandledDataRef.current = [];
+      inputFallbackStateRef.current = createTerminalInputFallbackState();
       pendingTerminalSizeRef.current = null;
       lastSentTerminalSizeRef.current = null;
       resizeInFlightRef.current = false;
