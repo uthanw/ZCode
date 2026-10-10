@@ -133,8 +133,9 @@ export function applyStickyShiftToInputData(data: string): string {
   return out;
 }
 
-
-export function findXtermTextarea(container: Element | null | undefined): HTMLTextAreaElement | null {
+export function findXtermTextarea(
+  container: Element | null | undefined,
+): HTMLTextAreaElement | null {
   return container?.querySelector<HTMLTextAreaElement>(".xterm-helper-textarea") ?? null;
 }
 
@@ -187,6 +188,7 @@ type TermBridge = {
 const termBridges = new WeakMap<XTerm, TermBridge>();
 const termElementsByShell = new WeakMap<Element, XTerm>();
 
+// eslint-disable-next-line no-control-regex -- 终端转义序列中 ESC(\u001b) 是协议本身的一部分，这里必须按字面匹配
 const DEC_PRIVATE_MODE = /\u001b\[\?(\d{3,4})(h|l)/g;
 
 /** 在 PTY 输出路径上调用：跟踪程序开关鼠标上报的模式。 */
