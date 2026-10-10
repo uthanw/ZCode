@@ -20,6 +20,8 @@ import {
   formatTerminalTabTitle,
   getNextTerminalSessionIndex,
   getTerminalSessionCloseAction,
+  persistTerminalPanelState,
+  restoreWorkspaceTerminalState,
   type TerminalPanelState,
   type TerminalSessionDescriptor,
 } from "@/terminal/terminalPanelState.js";
@@ -74,14 +76,60 @@ export function Terminal({
     // 业务逻辑：终端会话按 workspace identity 隔离保存，切换 workspace 时只切换可见 tab，
     // 不卸载旧 workspace 的 xterm/PTY，避免长时间运行的命令因为 React 生命周期变化被杀掉。
     // PTY exit 会删除最后一个 session；面板下次重新打开时也通过这里懒创建新终端。
-    setPanelState((current) =>
-      ensureWorkspaceTerminalState(current, {
+    // 刷新页面时先尝试按 localStorage 恢复会话（PTY 在客户端断开后仍存活于服务端），
+    // 恢复出的 session 带 serverId，TerminalSession 会重连而不是新建。
+    setPanelState((current) => {
+      // 刷新恢复：localStorage 里的 session 带 serverId 说明服务端 PTY 还活着。
+      // 当前 state 里同一 workspace 的 session 都没 serverId（本次刚建的空壳）时，
+      // 直接用恢复出的会话整组替换，避免同一个 workspace 同时存在两批 tab。
+      const currentWorkspace = current.workspaces[workspaceKey];
+      const currentHasLive = Boolean(
+        currentWorkspace &&
+          currentWorkspace.sessionIds.some((id) => Boolean(current.sessions[id]?.serverId)),
+      );
+
+      const restored = restoreWorkspaceTerminalState({ workspaceKey, services, cwd });
+      const restoredWorkspace = restored?.workspaces[workspaceKey];
+      const restoredHasLive = Boolean(
+        restored && Object.values(restored.sessions).some((session) => Boolean(session.serverId)),
+      );
+
+      if (restored && restoredWorkspace && restoredHasLive && !currentHasLive) {
+        // 恢复出的会话整组替换当前空壳会话。必须把被替换掉的空壳 session 从
+        // sessions 表里删掉：TabsContent 是 forceMount 的，只从 sessionIds 摘除
+        // 不会让它们卸载，刚 create 出来的 PTY 会变成隐藏孤儿进程。
+        const restoredIds = new Set(restoredWorkspace.sessionIds);
+        const prunedSessions: Record<string, TerminalSessionDescriptor> = {};
+        for (const [id, session] of Object.entries(current.sessions)) {
+          if (session.workspaceKey !== workspaceKey || restoredIds.has(id)) {
+            prunedSessions[id] = session;
+          }
+        }
+        return {
+          sessions: {
+            ...prunedSessions,
+            ...restored.sessions,
+          },
+          workspaces: {
+            ...current.workspaces,
+            [workspaceKey]: restoredWorkspace,
+          },
+        };
+      }
+
+      return ensureWorkspaceTerminalState(current, {
         workspaceKey,
         services,
         cwd,
-      }),
-    );
+      });
+    });
   }, [cwd, isVisible, services, workspaceKey]);
+
+  useEffect(() => {
+    // 终端会话状态（含服务端 PTY id 映射）持久化到 localStorage：
+    // 刷新/重开页面后按 workspace 恢复 tab 列表并重连同一个 PTY。
+    persistTerminalPanelState(panelState);
+  }, [panelState]);
 
   useEffect(() => {
     const exitedWorkspaceKey = closePanelAfterExitWorkspaceRef.current;
@@ -275,6 +323,24 @@ export function Terminal({
     });
   }, []);
 
+  // 拿到（新建或重连成功的）服务端 PTY id 后写入 descriptor，
+  // 随后 persist effect 落 localStorage，刷新页面时才能重连同一个 PTY。
+  const handleServerIdAcquired = useCallback((sessionId: string, serverId: string) => {
+    setPanelState((current) => {
+      const session = current.sessions[sessionId];
+      if (!session || session.serverId === serverId) {
+        return current;
+      }
+      return {
+        ...current,
+        sessions: {
+          ...current.sessions,
+          [sessionId]: { ...session, serverId },
+        },
+      };
+    });
+  }, []);
+
   const workspace = panelState.workspaces[workspaceKey];
   const currentSessions =
     workspace?.sessionIds
@@ -370,6 +436,8 @@ export function Terminal({
                 sessionId={session.id}
                 services={session.services}
                 cwd={session.cwd}
+                resumeServerId={session.serverId}
+                onServerIdAcquired={handleServerIdAcquired}
                 isVisible={
                   isVisible &&
                   session.workspaceKey === workspaceKey &&

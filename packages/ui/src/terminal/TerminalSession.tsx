@@ -32,9 +32,11 @@ import { normalizePowerShellReadlineRedraw } from "@/terminal/terminalDataTransf
 import { installTerminalTouchScroll } from "@/terminal/terminalTouchScroll.js";
 import {
   applyStickyCtrlToInputData,
+  applyStickyShiftToInputData,
   consumeStickyCtrl,
   hardenTerminalTextarea,
   isStickyCtrlActive,
+  isStickyShiftActive,
   noteTerminalOutput,
 } from "@/terminal/terminalExtraKeys.js";
 import { getHttpLinksForTerminalBufferLine } from "@/terminal/terminalLinks.js";
@@ -105,6 +107,8 @@ export function TerminalSession({
   onOpenBrowserUrl,
   persistentKey,
   workspaceKey,
+  resumeServerId,
+  onServerIdAcquired,
 }: {
   sessionId: string;
   services: IServiceAccessor;
@@ -115,6 +119,14 @@ export function TerminalSession({
   onShellLabelChange: (sessionId: string, shellLabel: string | null) => void;
   onExit?: (sessionId: string, exitCode: number) => void;
   onOpenBrowserUrl: (url: string) => void;
+  /**
+   * 刷新恢复用：localStorage 里记录的服务端 PTY id。传入时先 has() 探活，
+   * 存活则订阅同一个 PTY 并回放服务端缓冲（长跑任务的输出不丢），
+   * 不存活/探活失败则回退到新建，行为与首次打开一致。
+   */
+  resumeServerId?: string;
+  /** 拿到（新建或重连成功的）服务端 PTY id 后回调，供面板状态持久化。 */
+  onServerIdAcquired?: (sessionId: string, serverId: string) => void;
   /**
    * 跨组件生命周期的会话复用 key（仅 side pane terminal 用）。
    * 传入后 xterm 实例 + PTY 所有权上移到 sidePaneTerminalSessionRegistry 模块级单例，
@@ -147,6 +159,10 @@ export function TerminalSession({
   const exitedMessageRef = useRef("");
   const exitHandlerRef = useRef(onExit);
   const openBrowserUrlRef = useRef(onOpenBrowserUrl);
+  // refresh 恢复目标只在挂载时定格：create 路径拿到 id 后 onServerIdAcquired 会把
+  // resumeServerId 从 undefined 变成新 id，若进 effect deps 会触发整个 effect 重跑，
+  // cleanup 会把刚创建的 PTY dispose 掉。挂载时读一次 ref 即可。
+  const resumeServerIdRef = useRef(resumeServerId);
   const terminalProfileThemeRef = useRef<ITheme | undefined>(undefined);
   const pendingInputFallbacksRef = useRef<PendingTerminalInputFallback[]>([]);
   const inputFallbackKeydownCandidateRef = useRef<TerminalInputFallbackKeydownCandidate | null>(
@@ -465,6 +481,12 @@ export function TerminalSession({
           term.input(String.fromCharCode(e.key.charCodeAt(0) & 0x1f));
           return false;
         }
+        // 粘滞 Shift 是锁定式的（一直生效到手动关闭），这里只标记，
+        // 不在这里发字节：软键盘路径会走 onData 漏斗统一变换。
+        if (isStickyShiftActive() && !e.shiftKey && e.key.length === 1 && !e.ctrlKey && !e.altKey) {
+          e.preventDefault();
+          e.stopPropagation();
+        }
         inputFallbackKeydownCandidateRef.current =
           e.metaKey || e.ctrlKey || e.altKey
             ? null
@@ -650,7 +672,7 @@ export function TerminalSession({
             term.onData((rawData) => {
               // 粘滞 Ctrl 统一漏斗：Android 软键盘走 composition、不发标准 keydown，
               // 只有 onData 能覆盖全部输入路径（keydown/组合输入/粘贴）。
-              const data = applyStickyCtrlToInputData(rawData);
+              const data = applyStickyShiftToInputData(applyStickyCtrlToInputData(rawData));
               const now = performance.now();
               const inputFallbackKeydownCandidate = inputFallbackKeydownCandidateRef.current;
               const handledData = recordTerminalInputFallbackHandledData({
@@ -850,6 +872,12 @@ export function TerminalSession({
         term.input(String.fromCharCode(e.key.charCodeAt(0) & 0x1f));
         return false;
       }
+      // 与上方 persistentKey 路径一致：粘滞 Shift 是锁定式的，这里只标记，
+      // 不在这里发字节：软键盘路径会走 onData 漏斗统一变换。
+      if (isStickyShiftActive() && !e.shiftKey && e.key.length === 1 && !e.ctrlKey && !e.altKey) {
+        e.preventDefault();
+        e.stopPropagation();
+      }
       inputFallbackKeydownCandidateRef.current =
         e.metaKey || e.ctrlKey || e.altKey
           ? null
@@ -923,74 +951,93 @@ export function TerminalSession({
 
     // 优先使用 workspace 路径作为 terminal 工作目录，未设置时后端回退到 HOME
     const initialCreateSize = initialTerminalSize ?? { cols: term.cols, rows: term.rows };
-    terminalService
-      .create({ cols: initialCreateSize.cols, rows: initialCreateSize.rows, cwd })
-      .then(({ id, shell, fontFamily, fontSize, theme, fontFamilySource, windowsPty }) => {
-        if (disposed) {
+    const attachTerminal = (
+      result: {
+        id: string;
+        shell: string;
+        fontFamily: string;
+        fontSize?: number;
+        theme?: ITheme;
+        fontFamilySource?: string;
+        windowsPty?: IWindowsPty;
+      },
+      replay: string,
+      createdLocally = false,
+    ): void => {
+      const { id, shell, fontFamily, fontSize, theme, fontFamilySource, windowsPty } = result;
+      if (disposed) {
+        // 只回收本会话新建的 PTY；resume 分支的 PTY 属于刷新前页面，不能杀。
+        if (createdLocally) {
           terminalService.dispose({ id });
-          return;
         }
+        return;
+      }
 
-        terminalIdRef.current = id;
-        // 首次 fit 或 ResizeObserver 可能早于 terminal id ready，先把 resize
-        // 暂存在 pendingTerminalSizeRef；id ready 后必须主动 flush，否则相同尺寸会被去重逻辑跳过。
-        flushTerminalServiceResize();
-        // Windows ConPTY 在 resize 增高时不会像传统 Unix PTY 一样把 scrollback 拉回 viewport，
-        // 不开启 xterm 的 windowsPty 兼容会让 PSReadLine 后续按旧坐标重绘输入，覆盖到上一条命令输出行。
-        term.options.windowsPty = normalizeWindowsPtyOption(windowsPty);
-        term.options.fontFamily = fontFamily || DEFAULT_TERMINAL_FONT_FAMILY;
-        const nextFontSize = normalizeTerminalFontSize(fontSize);
-        if (nextFontSize) {
-          term.options.fontSize = nextFontSize;
-        }
-        terminalProfileThemeRef.current = theme as ITheme | undefined;
-        term.options.theme = mergeTerminalTheme(terminalProfileThemeRef.current);
-        const nextShellLabel = formatShellLabel(shell);
-        logger.info("[Terminal] shell resolved:", {
-          cwd,
-          fontFamilySource,
-          shell,
-          shellLabel: nextShellLabel,
-          terminalId: id,
-          terminalTabId: sessionId,
-        });
-        onShellLabelChange(sessionId, nextShellLabel);
-        scheduleFitAndResize("init");
-        if (isVisibleRef.current) {
-          requestFocus();
-        }
+      terminalIdRef.current = id;
+      onServerIdAcquired?.(sessionId, id);
+      // 首次 fit 或 ResizeObserver 可能早于 terminal id ready，先把 resize
+      // 暂存在 pendingTerminalSizeRef；id ready 后必须主动 flush，否则相同尺寸会被去重逻辑跳过。
+      flushTerminalServiceResize();
+      // Windows ConPTY 在 resize 增高时不会像传统 Unix PTY 一样把 scrollback 拉回 viewport，
+      // 不开启 xterm 的 windowsPty 兼容会让 PSReadLine 后续按旧坐标重绘，覆盖到上一条命令输出行。
+      term.options.windowsPty = normalizeWindowsPtyOption(windowsPty);
+      term.options.fontFamily = fontFamily || DEFAULT_TERMINAL_FONT_FAMILY;
+      const nextFontSize = normalizeTerminalFontSize(fontSize);
+      if (nextFontSize) {
+        term.options.fontSize = nextFontSize;
+      }
+      terminalProfileThemeRef.current = theme as ITheme | undefined;
+      term.options.theme = mergeTerminalTheme(terminalProfileThemeRef.current);
+      const nextShellLabel = formatShellLabel(shell);
+      logger.info("[Terminal] shell resolved:", {
+        cwd,
+        fontFamilySource,
+        shell,
+        shellLabel: nextShellLabel,
+        terminalId: id,
+        terminalTabId: sessionId,
+      });
+      onShellLabelChange(sessionId, nextShellLabel);
+      if (replay) {
+        // 刷新恢复：先整体回放服务端缓冲（含断连期间输出），再订阅实时流。
+        term.write(normalizePowerShellReadlineRedraw(replay, shell));
+      }
+      scheduleFitAndResize("init");
+      if (isVisibleRef.current) {
+        requestFocus();
+      }
 
-        disposables.push(
-          terminalService.onDynamicData(id)((data) => {
-            noteTerminalOutput(term, data);
-            term.write(normalizePowerShellReadlineRedraw(data, shell));
-          }),
-        );
+      disposables.push(
+        terminalService.onDynamicData(id)((data) => {
+          noteTerminalOutput(term, data);
+          term.write(normalizePowerShellReadlineRedraw(data, shell));
+        }),
+      );
 
-        disposables.push(
-          terminalService.onDynamicExit(id)((exitCode) => {
-            const exitHandler = exitHandlerRef.current;
-            logger.info("[Terminal] terminal session exited", {
-              autoClose: Boolean(exitHandler),
-              exitCode,
-              terminalId: id,
-              terminalTabId: sessionId,
-            });
-            if (exitHandler) {
-              exitHandler(sessionId, exitCode);
-              return;
-            }
+      disposables.push(
+        terminalService.onDynamicExit(id)((exitCode) => {
+          const exitHandler = exitHandlerRef.current;
+          logger.info("[Terminal] terminal session exited", {
+            autoClose: Boolean(exitHandler),
+            exitCode,
+            terminalId: id,
+            terminalTabId: sessionId,
+          });
+          if (exitHandler) {
+            exitHandler(sessionId, exitCode);
+            return;
+          }
 
-            // side pane Terminal 不属于底部 tab registry，未传 onExit 时继续保留退出提示。
-            term.write(`\r\n${exitedMessageRef.current}\r\n`);
-          }),
-        );
+          // side pane Terminal 不属于底部 tab registry，未传 onExit 时继续保留退出提示。
+          term.write(`\r\n${exitedMessageRef.current}\r\n`);
+        }),
+      );
 
         disposables.push(
           term.onData((rawData) => {
-            // 与 persistentKey 路径一致：粘滞 Ctrl 在 onData 漏斗上统一应用，
+            // 与 persistentKey 路径一致：粘滞 Ctrl / Shift 在 onData 漏斗上统一应用，
             // 覆盖软键盘 composition 等不产生标准 keydown 的输入模型。
-            const data = applyStickyCtrlToInputData(rawData);
+            const data = applyStickyShiftToInputData(applyStickyCtrlToInputData(rawData));
             const now = performance.now();
             const inputFallbackKeydownCandidate = inputFallbackKeydownCandidateRef.current;
             const handledData = recordTerminalInputFallbackHandledData({
@@ -1075,15 +1122,54 @@ export function TerminalSession({
             dispose: () => textarea.removeEventListener("input", handleInput, true),
           } as IDisposable);
         }
-      })
-      .catch((error) => {
+    };
+
+    // 刷新恢复：优先重连 localStorage 记录的服务端 PTY（服务端在客户端断连时按设计不回收 pty），
+    // 存活则回放服务端缓冲并订阅同一个实例；探活失败（如 host 重启）回退全新 create。
+    const resumeTargetId = resumeServerIdRef.current;
+    const setupTerminal = async (): Promise<void> => {
+      if (resumeTargetId) {
+        try {
+          const alive = await terminalService.has({ id: resumeTargetId });
+          if (alive) {
+            const [profile, replay] = await Promise.all([
+              terminalService.inspect({ id: resumeTargetId }),
+              terminalService.readScrollback({ id: resumeTargetId }),
+            ]);
+            if (profile && !disposed) {
+              logger.info("[Terminal] resumed after refresh", {
+                terminalId: resumeTargetId,
+                terminalTabId: sessionId,
+              });
+              // PTY 存活但 create 于旧版本（无 scrollback 缓冲）时 replay 为空串，照常续接实时流。
+              attachTerminal({ ...profile, id: resumeTargetId }, replay);
+              return;
+            }
+          }
+        } catch (error) {
+          // 探活/回放失败不阻断：回退到新建，行为与首次打开一致。
+          logger.warn("[Terminal] resume failed, falling back to create:", error);
+        }
+      }
+
+      try {
+        const created = await terminalService.create({
+          cols: initialCreateSize.cols,
+          rows: initialCreateSize.rows,
+          cwd,
+        });
+        attachTerminal(created, "", true);
+      } catch (error) {
         // 之前没有接住 create() 的拒绝态，终端启动失败会直接变成 Uncaught Promise。
         // 这里显式记录错误，并在终端区域提示用户，方便定位到底是 shell 还是 cwd 出了问题。
         if (disposed) return;
         const message = error instanceof Error ? error.message : String(error);
         logger.error("[Terminal] failed to create terminal:", error);
         term.write(`\r\n[Terminal failed to start]\r\n${message}\r\n`);
-      });
+      }
+    };
+
+    void setupTerminal();
 
     let resizeRAF = 0;
     const resizeObserver = new ResizeObserver(() => {
@@ -1127,6 +1213,9 @@ export function TerminalSession({
     services,
     sessionId,
     persistentKey,
+    // resumeServerId 刻意不进 deps：挂载时从 resumeServerIdRef 读取一次；
+    // acquire 后 prop 从 undefined 变为新 id，进 deps 会让 effect 重跑并 dispose 刚建的 PTY。
+    onServerIdAcquired,
   ]);
 
   const handleCopy = () => {

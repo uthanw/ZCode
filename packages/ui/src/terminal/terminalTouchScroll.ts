@@ -51,12 +51,17 @@ const onTouchStart = (event: TouchEvent) => {
     active = false;
     return;
   }
-  const viewport = viewportOf(event.target);
-  if (!viewport) {
+  const touch = event.touches[0];
+  if (!touch) {
     active = false;
     return;
   }
-  const touch = event.touches[0];
+  const shell = shellOf(event.target);
+  const viewport = viewportOf(event.target);
+  if (!shell || !viewport) {
+    active = false;
+    return;
+  }
   active = true;
   touchId = touch.identifier;
   startX = touch.clientX;
@@ -64,7 +69,7 @@ const onTouchStart = (event: TouchEvent) => {
   startScrollTop = viewport.scrollTop;
   // 程序开着鼠标上报（TUI）时滚轮语义优先，即便有回滚也不本地滚动——
   // 与桌面端滚轮行为一致（桌面滚轮在 TUI 里走的是同一条鼠标协议路径）。
-  const term = getTermForShell(shellOf(event.target));
+  const term = getTermForShell(shell);
   scrollMode = !(term && acceptsMouseWheel(term)) && viewport.scrollHeight > viewport.clientHeight;
   tuiArrowsSent = 0;
 };
@@ -76,7 +81,7 @@ const onTouchMove = (event: TouchEvent) => {
     return;
   }
   const touch = event.touches[0];
-  if (touch.identifier !== touchId) {
+  if (!touch || touch.identifier !== touchId) {
     active = false;
     return;
   }

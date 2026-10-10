@@ -8,6 +8,11 @@ export interface TerminalSessionDescriptor {
   cwd?: string;
   index: number;
   shellLabel: string | null;
+  /**
+   * 服务端 PTY id。与客户端 UUID 分开维护：PTY 在页面刷新/客户端断开后仍然存活，
+   * 刷新后按这个 id 调 terminalService.has/readScrollback 重连并回放缓冲。
+   */
+  serverId?: string;
 }
 
 export interface TerminalWorkspaceState {
@@ -194,4 +199,119 @@ export function ensureWorkspaceTerminalState(
       [params.workspaceKey]: workspace,
     },
   };
+}
+
+/* ------------------------------------------------------------------ */
+/*  会话持久化：刷新/重开后按 workspace 恢复 tab 并重连服务端 PTY        */
+/* ------------------------------------------------------------------ */
+
+export interface PersistedTerminalSession {
+  id: string;
+  serverId?: string;
+  index: number;
+  cwd?: string;
+  shellLabel?: string | null;
+}
+
+export interface PersistedTerminalWorkspace {
+  activeSessionId: string;
+  sessions: PersistedTerminalSession[];
+}
+
+const TERMINAL_SESSIONS_STORAGE_KEY = "zcode.web.terminal.sessions.v1";
+const TERMINAL_SESSIONS_MAX_WORKSPACES = 20;
+
+export function loadPersistedTerminalWorkspaces(): Record<string, PersistedTerminalWorkspace> {
+  if (typeof window === "undefined" || !window.localStorage) return {};
+  try {
+    const raw = window.localStorage.getItem(TERMINAL_SESSIONS_STORAGE_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw) as Record<string, PersistedTerminalWorkspace>;
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+/** 从 localStorage 恢复指定 workspace 的终端 tab；没有可恢复内容时返回 null。 */
+export function restoreWorkspaceTerminalState(params: {
+  workspaceKey: string;
+  services: IServiceAccessor;
+  cwd?: string;
+}): TerminalPanelState | null {
+  const persisted = loadPersistedTerminalWorkspaces()[params.workspaceKey];
+  if (!persisted?.sessions?.length) return null;
+
+  const sessions: Record<string, TerminalSessionDescriptor> = {};
+  const sessionIds: string[] = [];
+  for (const entry of persisted.sessions) {
+    if (!entry?.id || typeof entry.index !== "number") continue;
+    sessions[entry.id] = {
+      id: entry.id,
+      workspaceKey: params.workspaceKey,
+      services: params.services,
+      cwd: entry.cwd ?? params.cwd,
+      index: entry.index,
+      shellLabel: entry.shellLabel ?? null,
+      serverId: entry.serverId,
+    };
+    sessionIds.push(entry.id);
+  }
+  if (!sessionIds.length) return null;
+  // 会话列表非空由上方守卫保证；取首项兜底 activeSessionId 的类型收窄。
+  const firstSessionId = sessionIds[0] as string;
+
+  const activeSessionId =
+    persisted.activeSessionId && sessions[persisted.activeSessionId]
+      ? persisted.activeSessionId
+      : firstSessionId;
+
+  return {
+    sessions,
+    workspaces: {
+      [params.workspaceKey]: {
+        sessionIds,
+        activeSessionId,
+      },
+    },
+  };
+}
+
+/** panelState 变化时调用：把会话描述符（含服务端 PTY id 映射）写入 localStorage。 */
+export function persistTerminalPanelState(state: TerminalPanelState): void {
+  if (typeof window === "undefined" || !window.localStorage) return;
+  try {
+    const payload: Record<string, PersistedTerminalWorkspace> = {};
+    for (const [workspaceKey, workspace] of Object.entries(state.workspaces)) {
+      const sessions = workspace.sessionIds
+        .map((sessionId) => state.sessions[sessionId])
+        .filter((session): session is TerminalSessionDescriptor => Boolean(session))
+        .map((session) => ({
+          id: session.id,
+          // 只持久化已经拿到服务端 PTY id 的会话：空壳 session 重建后
+          // 会自己 create 出新 PTY，记录它反而会在恢复时连到已死的 id。
+          serverId: session.serverId,
+          index: session.index,
+          cwd: session.cwd,
+          shellLabel: session.shellLabel,
+        }));
+      if (!sessions.length) continue;
+      payload[workspaceKey] = {
+        activeSessionId: workspace.activeSessionId,
+        sessions,
+      };
+    }
+
+    const workspaceKeys = Object.keys(payload).slice(-TERMINAL_SESSIONS_MAX_WORKSPACES);
+    const trimmed: Record<string, PersistedTerminalWorkspace> = {};
+    for (const key of workspaceKeys) {
+      const entry = payload[key];
+      if (entry) {
+        trimmed[key] = entry;
+      }
+    }
+    window.localStorage.setItem(TERMINAL_SESSIONS_STORAGE_KEY, JSON.stringify(trimmed));
+  } catch {
+    // 持久化失败只影响刷新恢复（配额/隐私模式等），不干扰终端运行。
+  }
 }

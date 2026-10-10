@@ -12,10 +12,11 @@
  * 键盘翻译层会处理 DECCKM（应用光标模式）等终端模式，比手写转义序列更可靠。
  */
 
-type KeyInit = {
+export type KeyInit = {
   key: string;
   keyCode: number;
   ctrlKey?: boolean;
+  shiftKey?: boolean;
 };
 
 let stickyCtrlActive = false;
@@ -57,6 +58,82 @@ export function applyStickyCtrlToInputData(data: string): string {
   return String.fromCharCode(code & 0x1f) + data.slice(1);
 }
 
+/* ---------------------------- 粘滞 Shift ---------------------------- */
+
+// 与 Ctrl 不同，Shift 是「锁定式」粘滞：开启后持续生效直到再次点按关闭。
+// 一次性 Shift 在软键盘上打字时几乎无法使用（每敲一个字母都要点两次）。
+let stickyShiftActive = false;
+const stickyShiftListeners = new Set<(active: boolean) => void>();
+
+export function setStickyShift(active: boolean): void {
+  stickyShiftActive = active;
+  for (const listener of stickyShiftListeners) listener(active);
+}
+
+export function isStickyShiftActive(): boolean {
+  return stickyShiftActive;
+}
+
+/** 订阅粘滞 Shift 状态变化（按键栏镜像样式）。 */
+export function onStickyShiftChange(listener: (active: boolean) => void): () => void {
+  stickyShiftListeners.add(listener);
+  return () => stickyShiftListeners.delete(listener);
+}
+
+/** US 布局的 Shift 符号层；字母走 toUpperCase，不在这里。 */
+const SHIFT_SYMBOLS: Record<string, string> = {
+  "`": "~",
+  "1": "!",
+  "2": "@",
+  "3": "#",
+  "4": "$",
+  "5": "%",
+  "6": "^",
+  "7": "&",
+  "8": "*",
+  "9": "(",
+  "0": ")",
+  "-": "_",
+  "=": "+",
+  "[": "{",
+  "]": "}",
+  "\\": "|",
+  ";": ":",
+  "'": '"',
+  ",": "<",
+  ".": ">",
+  "/": "?",
+};
+
+/** 单字符的 Shift 变体；无变体时原样返回。 */
+export function applyShiftToKeyChar(char: string): string {
+  if (char.length !== 1) return char;
+  const upper = char.toUpperCase();
+  if (upper !== char) return upper;
+  return SHIFT_SYMBOLS[char] ?? char;
+}
+
+/**
+ * onData 漏斗上的粘滞 Shift 变换：软键盘只提交字符本身，Shift 信息完全丢失，
+ * 这里按 US 布局补上。整词上屏只变换每个可打印 ASCII 字符（"ab" → "AB"），
+ * 控制序列与中文等非 ASCII 字符原样保留。
+ *
+ * ESC 起头的数据是 xterm 键盘层翻译出的转义序列（方向键/F 键/修饰组合，
+ * 如 "\x1b[1;2A"），不是软键盘上屏文本，必须整体放行——否则 CSI 里的
+ * "[1;2" 会被 Shift 符号层逐字符改写成 "{!:@"。
+ */
+export function applyStickyShiftToInputData(data: string): string {
+  if (!stickyShiftActive || data.length === 0) return data;
+  if (data.charCodeAt(0) === 0x1b) return data;
+  let out = "";
+  for (const char of data) {
+    const code = char.charCodeAt(0);
+    out += code >= 32 && code <= 126 ? applyShiftToKeyChar(char) : char;
+  }
+  return out;
+}
+
+
 export function findXtermTextarea(container: Element | null | undefined): HTMLTextAreaElement | null {
   return container?.querySelector<HTMLTextAreaElement>(".xterm-helper-textarea") ?? null;
 }
@@ -64,7 +141,7 @@ export function findXtermTextarea(container: Element | null | undefined): HTMLTe
 /** 向 xterm 的隐藏 textarea 派发一对合成 keydown/keyup，让 xterm 键盘层完成翻译。 */
 export function sendXtermKey(
   container: Element | null | undefined,
-  { key, keyCode, ctrlKey = false }: KeyInit,
+  { key, keyCode, ctrlKey = false, shiftKey = false }: KeyInit,
 ): boolean {
   const textarea = findXtermTextarea(container);
   if (!textarea) return false;
@@ -75,6 +152,7 @@ export function sendXtermKey(
     bubbles: true,
     cancelable: true,
     ctrlKey,
+    shiftKey,
   };
   textarea.dispatchEvent(new KeyboardEvent("keydown", init));
   textarea.dispatchEvent(new KeyboardEvent("keyup", init));

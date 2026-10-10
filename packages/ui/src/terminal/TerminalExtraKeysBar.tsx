@@ -3,10 +3,14 @@ import { Keyboard } from "lucide-react";
 import { cn } from "@/components/lib/utils.js";
 import {
   EXTRA_KEY_CODES,
+  applyShiftToKeyChar,
   findXtermTextarea,
   isStickyCtrlActive,
+  isStickyShiftActive,
   onStickyCtrlChange,
+  onStickyShiftChange,
   setStickyCtrl,
+  setStickyShift,
   sendXtermKey,
   setTerminalKeyboardOpen,
   type KeyInit,
@@ -31,6 +35,7 @@ function TerminalExtraKeysBar({ getContainer }: { getContainer: () => HTMLElemen
     () => typeof window !== "undefined" && window.matchMedia(SHOW_BAR_QUERY).matches,
   );
   const [ctrlActive, setCtrlActive] = useState(false);
+  const [shiftActive, setShiftActive] = useState(false);
 
   useEffect(() => {
     const query = window.matchMedia(SHOW_BAR_QUERY);
@@ -42,6 +47,8 @@ function TerminalExtraKeysBar({ getContainer }: { getContainer: () => HTMLElemen
   // 模块状态是唯一事实源：软键盘路径在 onData 漏斗里消费粘滞 Ctrl 后，
   // 这里的样式也要跟着熄灭，否则用户会以为 Ctrl 还挂着。
   useEffect(() => onStickyCtrlChange(setCtrlActive), []);
+  // Shift 是锁定式粘滞（软键盘上每敲一字母要点两次没法用），状态只在按钮切换时变化。
+  useEffect(() => onStickyShiftChange(setShiftActive), []);
 
   // 虚拟键盘默认被 inputmode=none 抑制（点终端不弹键盘），这里显式拉起/收起。
   const [keyboardOpen, setKeyboardOpen] = useState(false);
@@ -56,9 +63,16 @@ function TerminalExtraKeysBar({ getContainer }: { getContainer: () => HTMLElemen
   // 粘滞 Ctrl 以模块状态为唯一事实源：软键盘输入可能在 customKeyEventHandler
   // 里消费掉粘滞（consumeStickyCtrl），栏上的 React 状态只是样式镜像，
   // 发送前必须重读，否则会把普通按键错误地修饰成 Ctrl 组合。
+  // 粘滞 Shift 是锁定式的：不随发送熄灭，只有再点 SHIFT 才关闭。
   const press = (init: KeyInit) => {
     const useCtrl = isStickyCtrlActive();
-    sendXtermKey(getContainer(), { ...init, ctrlKey: useCtrl });
+    const useShift = isStickyShiftActive();
+    const keyInit: KeyInit = { ...init, ctrlKey: useCtrl, shiftKey: useShift || init.shiftKey };
+    if (useShift && init.key.length === 1) {
+      // 符号键在 Shift 层上直接换成变体字符（"1"→"!"），软键盘没有 Shift 概念。
+      keyInit.key = applyShiftToKeyChar(init.key);
+    }
+    sendXtermKey(getContainer(), keyInit);
     if (useCtrl || ctrlActive) {
       setStickyCtrl(false);
       setCtrlActive(false);
@@ -78,6 +92,13 @@ function TerminalExtraKeysBar({ getContainer }: { getContainer: () => HTMLElemen
     refocusTerminal();
   };
 
+  const toggleShift = () => {
+    const next = !shiftActive;
+    setShiftActive(next);
+    setStickyShift(next);
+    refocusTerminal();
+  };
+
   const keys: Array<{
     label: string;
     onPress: () => void;
@@ -85,6 +106,7 @@ function TerminalExtraKeysBar({ getContainer }: { getContainer: () => HTMLElemen
   }> = [
     { label: "ESC", onPress: () => press(EXTRA_KEY_CODES.escape) },
     { label: "CTRL", onPress: toggleCtrl, active: ctrlActive },
+    { label: "SHIFT", onPress: toggleShift, active: shiftActive },
     { label: "TAB", onPress: () => press(EXTRA_KEY_CODES.tab) },
     { label: "←", onPress: () => press(EXTRA_KEY_CODES.arrowLeft) },
     { label: "↑", onPress: () => press(EXTRA_KEY_CODES.arrowUp) },

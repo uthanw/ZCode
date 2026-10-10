@@ -5,11 +5,9 @@ import { delimiter, dirname, join, resolve } from "node:path";
 import { Emitter, type Event } from "@zcode/rpc";
 import type { IPty } from "node-pty";
 import type { ISettingService } from "../setting/setting.js";
-import type { ITerminalService, TerminalWindowsPtyInfo } from "./terminal.js";
+import type { ITerminalService, TerminalCreateResult, TerminalWindowsPtyInfo } from "./terminal.js";
 import {
   resolveTerminalFontProfile,
-  type TerminalFontFamilySource,
-  type TerminalThemeProfile,
 } from "./terminalProfile.js";
 import { registerMemoryDiagnosticsProvider } from "#src/memoryDiagnostics.js";
 
@@ -21,7 +19,17 @@ interface TerminalInstance {
   pty: IPty;
   dataEmitter: Emitter<string>;
   exitEmitter: Emitter<number>;
+  /**
+   * 断连期间的服务端回放缓冲：客户端刷新/断线重连后先回放这段再订阅实时流，
+   * PTY 本体在客户端断开时不回收（这正是本服务的历史行为），因此缓冲是有效的。
+   */
+  scrollback: string;
+  /** create 时的 shell/字体/主题信息，供重连 inspect 时原样恢复终端观感。 */
+  profile: TerminalCreateResult;
 }
+
+/** 回放缓冲上限：超出后从头丢弃，防止长输出任务把内存吃满。 */
+const TERMINAL_SCROLLBACK_LIMIT = 512 * 1024;
 
 let hasEnsuredNodePtyHelper = false;
 let nodePtyModulePromise: Promise<NodePtyModule> | null = null;
@@ -350,15 +358,7 @@ export function createTerminalService(dependencies: {
   }
 
   const service: ITerminalService & { disposeAll(): void } = {
-    async create(params: { cols: number; rows: number; cwd?: string }): Promise<{
-      id: string;
-      shell: string;
-      fontFamily: string;
-      fontSize?: number;
-      theme?: TerminalThemeProfile;
-      fontFamilySource: TerminalFontFamilySource;
-      windowsPty?: TerminalWindowsPtyInfo;
-    }> {
+    async create(params: { cols: number; rows: number; cwd?: string }): Promise<TerminalCreateResult> {
       const id = String(nextId++);
       const shell = resolveTerminalShell();
       const cwd = resolveTerminalCwd(params.cwd);
@@ -375,6 +375,22 @@ export function createTerminalService(dependencies: {
       ensureNodePtySpawnHelperExecutable();
       const dataEmitter = new Emitter<string>();
       const exitEmitter = new Emitter<number>();
+      const profile: TerminalCreateResult = {
+        id,
+        shell,
+        fontFamily: fontProfile.fontFamily,
+        fontSize: fontProfile.fontSize,
+        theme: fontProfile.theme,
+        fontFamilySource: fontProfile.source,
+        windowsPty: resolveTerminalWindowsPtyInfo(),
+      };
+      const instance: TerminalInstance = {
+        pty: null as unknown as IPty,
+        dataEmitter,
+        exitEmitter,
+        scrollback: "",
+        profile,
+      };
 
       let p: IPty;
       try {
@@ -392,7 +408,12 @@ export function createTerminalService(dependencies: {
         );
       }
 
-      p.onData((data) => dataEmitter.fire(data));
+      instance.pty = p;
+      p.onData((data) => {
+        // 服务端回放缓冲：先落盘再广播，重连客户端才能拿到断连期间的输出。
+        instance.scrollback = (instance.scrollback + data).slice(-TERMINAL_SCROLLBACK_LIMIT);
+        dataEmitter.fire(data);
+      });
       p.onExit(({ exitCode }) => {
         exitEmitter.fire(exitCode);
         dataEmitter.dispose();
@@ -400,20 +421,26 @@ export function createTerminalService(dependencies: {
         terminals.delete(id);
       });
 
-      terminals.set(id, { pty: p, dataEmitter, exitEmitter });
-      return {
-        id,
-        shell,
-        fontFamily: fontProfile.fontFamily,
-        fontSize: fontProfile.fontSize,
-        theme: fontProfile.theme,
-        fontFamilySource: fontProfile.source,
-        windowsPty: resolveTerminalWindowsPtyInfo(),
-      };
+      terminals.set(id, instance);
+      return profile;
     },
 
     async write(params: { id: string; data: string }): Promise<void> {
       getTerminal(params.id).pty.write(params.data);
+    },
+
+    async has(params: { id: string }): Promise<boolean> {
+      return terminals.has(params.id);
+    },
+
+    async readScrollback(params: { id: string }): Promise<string> {
+      return getTerminal(params.id).scrollback;
+    },
+
+    async inspect(params: { id: string }): Promise<TerminalCreateResult | null> {
+      const terminal = terminals.get(params.id);
+      // PTY 已退出或从未存在过时返回 null，客户端据此走全新 create 分支。
+      return terminal ? { ...terminal.profile } : null;
     },
 
     async resize(params: { id: string; cols: number; rows: number }): Promise<void> {
