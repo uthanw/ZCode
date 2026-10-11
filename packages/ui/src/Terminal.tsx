@@ -19,7 +19,6 @@ import {
   exitTerminalSession,
   formatTerminalTabTitle,
   getNextTerminalSessionIndex,
-  getTerminalSessionCloseAction,
   persistTerminalPanelState,
   restoreWorkspaceTerminalState,
   type TerminalPanelState,
@@ -239,35 +238,32 @@ export function Terminal({
 
   const handleCloseSession = useCallback(
     (sessionId: string) => {
-      const closeAction = getTerminalSessionCloseAction(panelState, sessionId);
-      if (closeAction === "close-panel") {
-        // 旧 UI 在只剩一个 tab 时直接隐藏关闭按钮，用户无法从 tab 完成关闭。
-        // 最后一个 tab 的关闭语义是收起整个面板并保活 session，与右上角关闭面板按钮保持一致。
-        logger.info("[Terminal] close terminal panel from last tab", {
-          terminalTabId: sessionId,
-          workspaceKey,
-        });
-        onClose();
+      const session = panelState.sessions[sessionId];
+      const workspace = session ? panelState.workspaces[session.workspaceKey] : undefined;
+      if (!session || !workspace?.sessionIds.includes(sessionId)) {
         return;
       }
 
-      if (closeAction !== "close-session") {
-        return;
-      }
-
+      // × = 真正关闭该终端：closeTerminalSession 删除 session（最后一个 tab 连
+      // workspace 记录一起删），PTY 由 TerminalSession 卸载清理 dispose，
+      // 持久化随之消失，刷新后不再恢复。右上角面板按钮才是「保活收起」。
+      const closesWorkspace = workspace.sessionIds.length === 1;
       setPanelState((current) => {
-        const session = current.sessions[sessionId];
         const next = closeTerminalSession(current, sessionId);
-        if (!session || next === current) {
+        if (next === current) {
           return current;
         }
 
         logger.info("[Terminal] close terminal tab", {
+          closesWorkspace,
           terminalTabId: sessionId,
           workspaceKey: session.workspaceKey,
         });
         return next;
       });
+      if (closesWorkspace) {
+        onClose();
+      }
     },
     [onClose, panelState, workspaceKey],
   );

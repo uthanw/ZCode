@@ -96,41 +96,35 @@ interface TerminalSessionExitResult {
   action: TerminalSessionCloseAction;
 }
 
-export function getTerminalSessionCloseAction(
-  state: TerminalPanelState,
-  sessionId: string,
-): TerminalSessionCloseAction {
-  const session = state.sessions[sessionId];
-  const workspace = session ? state.workspaces[session.workspaceKey] : undefined;
-  if (!session || !workspace?.sessionIds.includes(sessionId)) {
-    return "none";
-  }
-
-  return workspace.sessionIds.length === 1 ? "close-panel" : "close-session";
-}
-
+/**
+ * 手动关闭终端 tab（× 按钮）：任何情况下都是真关闭——删除 session，workspace
+ * 里最后一个 tab 关闭时连 workspace 记录一并删除。PTY 由 TerminalSession 卸载
+ * 清理 dispose，持久化随之消失，刷新后不会再恢复该会话。
+ * 与 PTY 自然退出（exitTerminalSession）的「真删」语义对齐；「只收起面板并保活」
+ * 仅属于右上角的面板收起按钮。
+ */
 export function closeTerminalSession(
   state: TerminalPanelState,
   sessionId: string,
 ): TerminalPanelState {
-  if (getTerminalSessionCloseAction(state, sessionId) !== "close-session") {
-    return state;
-  }
-
   const session = state.sessions[sessionId];
   const workspace = session ? state.workspaces[session.workspaceKey] : undefined;
-  if (!session || !workspace) {
+  if (!session || !workspace?.sessionIds.includes(sessionId)) {
     return state;
   }
 
   const closingIndex = workspace.sessionIds.indexOf(sessionId);
   const nextSessionIds = workspace.sessionIds.filter((id) => id !== sessionId);
-  const fallbackSessionId = nextSessionIds[Math.max(0, closingIndex - 1)] ?? nextSessionIds[0];
-  if (!fallbackSessionId) {
-    return state;
+  const { [sessionId]: _closedSession, ...nextSessions } = state.sessions;
+
+  if (!nextSessionIds.length) {
+    const { [session.workspaceKey]: _closedWorkspace, ...nextWorkspaces } = state.workspaces;
+    return { sessions: nextSessions, workspaces: nextWorkspaces };
   }
 
-  const { [sessionId]: _closedSession, ...nextSessions } = state.sessions;
+  // nextSessionIds 非空由上方守卫保证；取首项兜底类型收窄。
+  const fallbackSessionId = (nextSessionIds[Math.max(0, closingIndex - 1)] ??
+    nextSessionIds[0]) as string;
   return {
     sessions: nextSessions,
     workspaces: {
