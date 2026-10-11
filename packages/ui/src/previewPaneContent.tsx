@@ -1,7 +1,7 @@
 import type { MarkdownSelectionTarget } from "@/lib/conversationSelectionReference.js";
 /* eslint-disable max-lines -- PreviewPane 内容路由同时承载文本、图片、媒体、Office、PDF 和 PPTX 渲染。 */
 import type { BundledTheme } from "shiki";
-import { useMemo, type Ref, type SyntheticEvent, type UIEventHandler } from "react";
+import { lazy, Suspense, useMemo, type Ref, type SyntheticEvent, type UIEventHandler } from "react";
 import type { FileBinaryPreview, FileMediaPreview, FileTextSlice } from "@zcode/shared";
 import { inferCodeLanguage } from "@/lib/codeViewer.js";
 import type { CodeViewerSource } from "@/lib/codeViewer.js";
@@ -12,8 +12,6 @@ import { MarkdownPreviewContent } from "@/previewPaneMarkdownContent.js";
 import { CodeContent } from "@/previewPaneCodeContent.js";
 import { ImagePreviewContent, SvgPreviewContent } from "@/previewPaneImageContent.js";
 import { PreviewPaneMediaContent } from "@/previewPaneMediaContent.js";
-import { PdfPreviewContent } from "@/previewPanePdfContent.js";
-import { PptxPreviewContent } from "@/previewPanePptxContent.js";
 import { PatchFallbackContent } from "@/previewPanePatchFallbackContent.js";
 import { DiffViewer } from "@/components/ui/diff-viewer.js";
 import type { PdfViewerLabels, PdfViewerSource } from "@/components/ui/pdf-viewer.js";
@@ -21,10 +19,28 @@ import type { PptxPreviewViewerLabels } from "@/components/ui/pptx-preview-viewe
 import type { CodeCommentPreview, CodeCommentRange } from "@/lib/codeCommentContext.js";
 import type { Theme } from "@/useTheme.js";
 import type { OfficeFilePreviewKind } from "@/lib/officeFilePreview.js";
-import { PreviewPaneOfficeContent } from "@/previewPaneOfficeContent.js";
 import type { PptxElementReferenceSource } from "@/lib/pptxElementReference.js";
 import type { MediaCodeViewerSource, PptxReferencePreviewNavigation } from "@/lib/codeViewer.js";
 import { resolveCodeReviewContentProjection } from "@/previewPaneCodeReview.js";
+
+/*
+ * 三个重量级查看器懒加载：pdf.js / xlsx wasm / pptx renderer 各自几百 KB 到 2MB，
+ * 绝大多数会话从不打开 office/pdf 预览。此前静态 import 会把 ~4.5MB 拖进首屏
+ * 主包（构建期 INEFFECTIVE_DYNAMIC_IMPORT 警告的根源），首屏下载和解析都变慢。
+ * 与 WorkflowArtifactBody 的既有懒加载模式一致；Suspense fallback 复用各分支
+ * 原有的 loading 文案。
+ */
+const PdfPreviewContent = lazy(() =>
+  import("@/previewPanePdfContent.js").then((module) => ({ default: module.PdfPreviewContent })),
+);
+const PptxPreviewContent = lazy(() =>
+  import("@/previewPanePptxContent.js").then((module) => ({ default: module.PptxPreviewContent })),
+);
+const PreviewPaneOfficeContent = lazy(() =>
+  import("@/previewPaneOfficeContent.js").then((module) => ({
+    default: module.PreviewPaneOfficeContent,
+  })),
+);
 
 interface PreviewPaneContentProps {
   source: CodeViewerSource;
@@ -305,20 +321,38 @@ export function PreviewPaneContent({
       );
     }
 
-    return <PdfPreviewContent source={pdfViewerSource} labels={pdfViewerLabels} />;
+    return (
+      <Suspense
+        fallback={
+          <div className="p-3 text-ui-base text-foreground-subtle">
+            {intl.formatMessage({ id: "codeViewer.loadingPdf" })}
+          </div>
+        }
+      >
+        <PdfPreviewContent source={pdfViewerSource} labels={pdfViewerLabels} />
+      </Suspense>
+    );
   }
 
   if (source.type === "file" && officePreviewKind) {
     return (
-      <PreviewPaneOfficeContent
-        error={error}
-        kind={officePreviewKind}
-        loading={loadingOfficePreview}
-        onOpenBrowserUrl={onOpenBrowserUrl}
-        preview={officePreview}
-        resolvedTheme={resolvedTheme}
-        sourcePath={source.path}
-      />
+      <Suspense
+        fallback={
+          <div className="p-3 text-ui-base text-foreground-subtle">
+            {intl.formatMessage({ id: "codeViewer.loadingFile" })}
+          </div>
+        }
+      >
+        <PreviewPaneOfficeContent
+          error={error}
+          kind={officePreviewKind}
+          loading={loadingOfficePreview}
+          onOpenBrowserUrl={onOpenBrowserUrl}
+          preview={officePreview}
+          resolvedTheme={resolvedTheme}
+          sourcePath={source.path}
+        />
+      </Suspense>
     );
   }
 
@@ -345,15 +379,23 @@ export function PreviewPaneContent({
     }
 
     return (
-      <PptxPreviewContent
-        data={pptxPreviewData}
-        labels={pptxViewerLabels}
-        fileName={source.path}
-        onOpenBrowserUrl={onOpenBrowserUrl}
-        {...(pptxReferenceSource ? { referenceSource: pptxReferenceSource } : {})}
-        {...(pptxReferenceNavigation ? { referenceNavigation: pptxReferenceNavigation } : {})}
-        referenceNavigationReady={pptxReferenceNavigationReady}
-      />
+      <Suspense
+        fallback={
+          <div className="p-3 text-ui-base text-foreground-subtle">
+            {intl.formatMessage({ id: "codeViewer.loadingPptx" })}
+          </div>
+        }
+      >
+        <PptxPreviewContent
+          data={pptxPreviewData}
+          labels={pptxViewerLabels}
+          fileName={source.path}
+          onOpenBrowserUrl={onOpenBrowserUrl}
+          {...(pptxReferenceSource ? { referenceSource: pptxReferenceSource } : {})}
+          {...(pptxReferenceNavigation ? { referenceNavigation: pptxReferenceNavigation } : {})}
+          referenceNavigationReady={pptxReferenceNavigationReady}
+        />
+      </Suspense>
     );
   }
 
