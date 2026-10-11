@@ -27,6 +27,12 @@ import {
 /** TUI 模式下每滑过多少像素发送一枚方向键/滚轮事件。 */
 const TUI_ARROW_STEP_PX = 44;
 
+/**
+ * 回滚滚动的增益系数：1:1 跟手没有惯性补偿，真机上偏「沉」，按 Termux 手感
+ * 放大位移。起点原点的绝对映射不受增益影响（反向滑动不会漂移）。
+ */
+const SCROLLBACK_GAIN = 1.7;
+
 let active = false;
 let touchId = -1;
 let startX = 0;
@@ -98,7 +104,7 @@ const onTouchMove = (event: TouchEvent) => {
     }
     event.preventDefault();
     event.stopPropagation();
-    viewport.scrollTop = startScrollTop - deltaY;
+    viewport.scrollTop = startScrollTop - deltaY * SCROLLBACK_GAIN;
     return;
   }
 

@@ -38,7 +38,10 @@ import {
 
 const TERMINAL_RESIZE_DRAG_THROTTLE_MS = 300;
 
-type TerminalResizeReason = "drag" | "final" | "visible" | "init" | "observer";
+/** 双指捏合缩小的字号下限：整数步进，避免捏合过程频繁全量重绘。 */
+const TERMINAL_PINCH_MIN_FONT_SIZE = 8;
+
+type TerminalResizeReason = "drag" | "final" | "visible" | "init" | "observer" | "pinch";
 
 export function TerminalSession({
   sessionId,
@@ -296,6 +299,119 @@ export function TerminalSession({
     // 终端都经本组件挂载，在这里统一接管。
     return installTerminalTouchScroll();
   }, []);
+
+  useEffect(() => {
+    // 双指捏合改字号（Termux 语义，但只允许缩小）：默认字号即本会话上限，
+    // 捏合放大被钳制回默认——避免放大后列数过少；缩小到 8 号塞更多列。
+    // 字号驱动单元格缩放 → fit 得到真实的 cols/rows（分辨率）变化，不是 CSS
+    // 视觉缩放。监听挂在容器上、capture 抢在 xterm 内部触摸处理之前；
+    // .terminal-xterm-shell 的 touch-action:none 已挡掉浏览器页面捏合，这段
+    // 手势完全归这里管。字号不持久化，新会话回到 profile 字号。document 级
+    // 的单指滚动兜底遇双指自行退出，两者无竞争。
+    const el = containerRef.current;
+    if (!el) return;
+
+    let pinchActive = false;
+    let pinchIdA = -1;
+    let pinchIdB = -1;
+    let startDistance = 0;
+    let baseFontSize = 13;
+    let appliedFontSize = 13;
+    /** 会话默认字号（首次捏合起点定格）：捏合的上限，只许缩不许放。 */
+    let defaultFontSize: number | null = null;
+
+    const endPinch = (): void => {
+      pinchActive = false;
+      pinchIdA = -1;
+      pinchIdB = -1;
+    };
+
+    const onTouchStart = (event: TouchEvent): void => {
+      if (pinchActive || event.touches.length !== 2) return;
+      const a = event.touches[0];
+      const b = event.touches[1];
+      if (!a || !b) return;
+      if (!(a.target instanceof Element) || !(b.target instanceof Element)) return;
+      // 两指必须落在同一终端容器内，跨终端/按键栏的捏合不接管。
+      if (!el.contains(a.target) || !el.contains(b.target)) return;
+      const term = termRef.current;
+      if (!term) return;
+      const distance = Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY);
+      if (distance < 8) return;
+      pinchIdA = a.identifier;
+      pinchIdB = b.identifier;
+      startDistance = distance;
+      baseFontSize = typeof term.options.fontSize === "number" ? term.options.fontSize : 13;
+      appliedFontSize = Math.round(baseFontSize);
+      if (defaultFontSize === null) {
+        defaultFontSize = appliedFontSize;
+      }
+      pinchActive = true;
+      // 双指起手断掉派生的单击/双击，避免顺带触发聚焦或选区。
+      event.preventDefault();
+      event.stopPropagation();
+    };
+
+    const onTouchMove = (event: TouchEvent): void => {
+      if (!pinchActive) return;
+      let a: Touch | undefined;
+      let b: Touch | undefined;
+      for (let i = 0; i < event.touches.length; i += 1) {
+        const touch = event.touches[i];
+        if (!touch) continue;
+        if (touch.identifier === pinchIdA) a = touch;
+        else if (touch.identifier === pinchIdB) b = touch;
+      }
+      if (!a || !b) {
+        // 跟踪的触点少了一只：捏合结束（剩余手指不回落到滚动，等下一次起手）。
+        endPinch();
+        return;
+      }
+      const term = termRef.current;
+      if (!term) {
+        endPinch();
+        return;
+      }
+      const distance = Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY);
+      if (distance <= 0 || startDistance <= 0) return;
+      const cap = defaultFontSize ?? appliedFontSize;
+      const next = Math.min(
+        cap,
+        Math.max(
+          TERMINAL_PINCH_MIN_FONT_SIZE,
+          Math.round(baseFontSize * (distance / startDistance)),
+        ),
+      );
+      if (next !== appliedFontSize) {
+        appliedFontSize = next;
+        term.options.fontSize = next;
+        requestFitAndResize("pinch");
+      }
+      event.preventDefault();
+      event.stopPropagation();
+    };
+
+    const onTouchEnd = (event: TouchEvent): void => {
+      if (!pinchActive) return;
+      for (let i = 0; i < event.touches.length; i += 1) {
+        const touch = event.touches[i];
+        if (touch && (touch.identifier === pinchIdA || touch.identifier === pinchIdB)) return;
+      }
+      endPinch();
+    };
+
+    el.addEventListener("touchstart", onTouchStart, { capture: true, passive: false });
+    el.addEventListener("touchmove", onTouchMove, { capture: true, passive: false });
+    el.addEventListener("touchend", onTouchEnd, { capture: true, passive: true });
+    el.addEventListener("touchcancel", onTouchEnd, { capture: true, passive: true });
+
+    return () => {
+      el.removeEventListener("touchstart", onTouchStart, { capture: true });
+      el.removeEventListener("touchmove", onTouchMove, { capture: true });
+      el.removeEventListener("touchend", onTouchEnd, { capture: true });
+      el.removeEventListener("touchcancel", onTouchEnd, { capture: true });
+    };
+  }, [requestFitAndResize]);
 
   useEffect(() => {
     const wasResizing = isPanelResizingRef.current;
